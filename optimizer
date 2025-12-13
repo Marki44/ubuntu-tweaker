@@ -25,7 +25,7 @@ BASE_PACKAGES = [
     "openssl"
 ]
 
-# ---------------- UI (clean + modern, no box borders) ----------------
+# ---------------- UI (clean + modern) ----------------
 RESET   = "\033[0m"
 BOLD    = "\033[1m"
 DIM     = "\033[2m"
@@ -334,19 +334,44 @@ def action_release_upgrade_manual():
         log("Ubuntu only. Skipping.")
         return
 
+    # Build options based on current version
     if ver.startswith("20."):
-        target = "22.04 LTS (then later 24.04)"
+        print(f"{YELLOW}Detected:{RESET} Ubuntu {ver}\n")
+        print(f"{WHITE}Choose upgrade target:{RESET}")
+        print(menu_item("1", "Upgrade to 22.04 LTS", "recommended"))
+        print(menu_item("2", "Upgrade to 24.04 LTS", "not direct from 20.04"))
+        print()
+        choice = input("Select (1-2) or Q: ").strip().lower()
+        if choice in ("q", "quit", "0", "exit"):
+            log("Cancelled.")
+            return
+        if choice == "2":
+            print(f"\n{RED}Not supported as a normal direct upgrade from 20.04 → 24.04.{RESET}")
+            print(f"{DIM}Do 20.04 → 22.04 first, then run the upgrade again for 24.04.{RESET}")
+            return
+        target = "22.04 LTS"
     elif ver.startswith("22."):
+        print(f"{YELLOW}Detected:{RESET} Ubuntu {ver}\n")
+        print(f"{WHITE}Choose upgrade target:{RESET}")
+        print(menu_item("1", "Upgrade to 24.04 LTS", "recommended"))
+        print()
+        choice = input("Select (1) or Q: ").strip().lower()
+        if choice in ("q", "quit", "0", "exit"):
+            log("Cancelled.")
+            return
+        if choice != "1":
+            print(f"{RED}Invalid choice.{RESET}")
+            return
         target = "24.04 LTS"
     elif ver.startswith("24."):
-        log("Already on Ubuntu 24.x. Nothing to do.")
+        print(f"{YELLOW}Detected:{RESET} Ubuntu {ver}")
+        print(f"{GREEN}You are already on the latest supported version in this tool.{RESET}")
         return
     else:
         log(f"Unsupported Ubuntu version: {ver}")
         return
 
-    print(f"{YELLOW}Detected:{RESET} Ubuntu {ver}")
-    print(f"{YELLOW}Target:{RESET}   {target}\n")
+    print(f"\n{YELLOW}Target:{RESET} {target}")
     print(f"{DIM}This is interactive and must be supervised (tmux/screen + snapshot recommended).{RESET}\n")
 
     ans = input("Type YES to start: ").strip()
@@ -365,6 +390,7 @@ def action_release_upgrade_manual():
 
 def action_run_all():
     header("Run Everything")
+    # NOTE: This does NOT include release upgrade. Upgrade stays manual.
     action_update_upgrade_cleanup()
     action_install_base_tools()
     action_unattended_upgrades()
@@ -382,7 +408,7 @@ def action_run_all():
 
     action_update_upgrade_cleanup()
     action_report()
-    log("Done. (Release upgrade stays manual)")
+    log("Done. (Release upgrade is manual only)")
 
 # ----------------------- Menu -----------------------
 def menu():
@@ -390,28 +416,31 @@ def menu():
         os_name, os_ver = detect_ubuntu()
         print_menu_header(os_name, os_ver)
 
+        print(f"{BOLD}{WHITE}Main{RESET}")
+        print(menu_item("1", "Run everything", "does not include release upgrade"))
+        print()
+
         print(f"{BOLD}{WHITE}Maintenance{RESET}")
-        print(menu_item("1", "Update + upgrade + cleanup"))
-        print(menu_item("2", "Install baseline tools"))
-        print(menu_item("3", "Enable automatic security updates"))
-        print(menu_item("4", "Limit system logs (journald)"))
-        print(menu_item("5", "Enable SSD trim (fstrim)"))
+        print(menu_item("2", "Update + upgrade + cleanup"))
+        print(menu_item("3", "Install baseline tools"))
+        print(menu_item("4", "Enable automatic security updates"))
+        print(menu_item("5", "Limit system logs (journald)"))
+        print(menu_item("6", "Enable SSD trim (fstrim)"))
         print()
 
         print(f"{BOLD}{WHITE}Tuning{RESET}")
-        print(menu_item("6", "Sysctl hardening"))
-        print(menu_item("7", "Enable BBR network tuning"))
-        print(menu_item("8", "Create swap (RAM expand)"))
+        print(menu_item("7", "Sysctl hardening"))
+        print(menu_item("8", "Enable BBR network tuning"))
+        print(menu_item("9", "Create swap (RAM expand)"))
         print()
 
         print(f"{BOLD}{WHITE}Tools{RESET}")
-        print(menu_item("9", "System report"))
-        print(menu_item("A", "Run everything", "asks for BBR/swap"))
+        print(menu_item("R", "System report"))
         print(menu_item("U", "Ubuntu release upgrade", "manual / interactive"))
         print()
 
         print(f"{DIM}{hr('─')}{RESET}")
-        choice = input(f"{BOLD}Select{RESET} {DIM}(1-9, A, U, Q){RESET}: ").strip().lower()
+        choice = input(f"{BOLD}Select{RESET} {DIM}(1-9, R, U, Q){RESET}: ").strip().lower()
 
         if choice in ("q", "quit", "0", "exit"):
             clear_screen()
@@ -420,16 +449,16 @@ def menu():
 
         clear_screen()
         try:
-            if choice == "1": action_update_upgrade_cleanup()
-            elif choice == "2": action_install_base_tools()
-            elif choice == "3": action_unattended_upgrades()
-            elif choice == "4": action_journald_limits()
-            elif choice == "5": action_enable_fstrim()
-            elif choice == "6": action_sysctl_hardening()
-            elif choice == "7": action_network_bbr()
-            elif choice == "8": action_create_swap()
-            elif choice == "9": action_report()
-            elif choice == "a": action_run_all()
+            if choice == "1": action_run_all()
+            elif choice == "2": action_update_upgrade_cleanup()
+            elif choice == "3": action_install_base_tools()
+            elif choice == "4": action_unattended_upgrades()
+            elif choice == "5": action_journald_limits()
+            elif choice == "6": action_enable_fstrim()
+            elif choice == "7": action_sysctl_hardening()
+            elif choice == "8": action_network_bbr()
+            elif choice == "9": action_create_swap()
+            elif choice == "r": action_report()
             elif choice == "u": action_release_upgrade_manual()
             else:
                 print(f"{RED}Invalid choice.{RESET}")
