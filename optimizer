@@ -2,8 +2,9 @@
 import os
 import sys
 import subprocess
+import shutil
 from datetime import datetime
-from typing import List  # <-- Python 3.8 compatible typing
+from typing import List
 
 LOG_FILE = "/var/log/server-baseline-menu.log"
 
@@ -24,7 +25,7 @@ BASE_PACKAGES = [
     "openssl"
 ]
 
-# ---------- UI (clean modern menu) ----------
+# ---------------- UI (clean + modern, no box borders) ----------------
 RESET   = "\033[0m"
 BOLD    = "\033[1m"
 DIM     = "\033[2m"
@@ -32,31 +33,47 @@ CYAN    = "\033[36m"
 GREEN   = "\033[32m"
 YELLOW  = "\033[33m"
 RED     = "\033[31m"
-MAGENTA = "\033[35m"
+WHITE   = "\033[37m"
+
+def is_tty() -> bool:
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+def term_width(default=90) -> int:
+    try:
+        return max(72, shutil.get_terminal_size((default, 24)).columns)
+    except Exception:
+        return default
 
 def clear_screen():
-    print("\033[2J\033[H", end="")
+    if is_tty():
+        print("\033[2J\033[H", end="")
+
+def hr(char="─") -> str:
+    return char * term_width()
 
 def pause_return():
-    input(f"\n{DIM}Press Enter to return to menu...{RESET}")
+    input(f"\n{DIM}Press Enter to return...{RESET}")
 
-def box_line(text: str, width: int) -> str:
-    if len(text) > width - 4:
-        text = text[: width - 7] + "..."
-    return f"│ {text.ljust(width - 4)} │"
+def print_menu_header(os_name: str, os_ver: str):
+    clear_screen()
+    print(f"{GREEN}{hr()}{RESET}")
+    title = f"{BOLD}{GREEN}Ubuntu Tweaker{RESET}"
+    print(title.center(term_width()))
+    sub = f"{DIM}{os_name} {os_ver}{RESET}"
+    print(sub.center(term_width()))
+    print(f"{GREEN}{hr()}{RESET}")
+    print(f"{DIM}Log:{RESET} {WHITE}{LOG_FILE}{RESET}\n")
 
-def print_box(title: str, lines: List[str], width: int = 74):  # <-- List[str] for py3.8
-    top = "┌" + "─" * (width - 2) + "┐"
-    mid = "├" + "─" * (width - 2) + "┤"
-    bot = "└" + "─" * (width - 2) + "┘"
-    print(top)
-    print(box_line(f"{BOLD}{title}{RESET}", width))
-    print(mid)
-    for ln in lines:
-        print(box_line(ln, width))
-    print(bot)
+def menu_item(key: str, label: str, hint: str = "") -> str:
+    k = f"{CYAN}{key:<2}{RESET}"
+    if hint:
+        return f" {k}  {WHITE}{label}{RESET}  {DIM}{hint}{RESET}"
+    return f" {k}  {WHITE}{label}{RESET}"
 
-# ---------- core helpers ----------
+# ---------------- Core helpers ----------------
 def is_root() -> bool:
     return os.geteuid() == 0
 
@@ -112,16 +129,16 @@ def action_update_upgrade_cleanup():
     run(["apt-get", "full-upgrade"] + APT_OPTS)
     run(["apt-get", "autoremove", "--purge"] + APT_OPTS)
     run(["apt-get", "autoclean"] + APT_OPTS)
-    log("Done: update/upgrade/full-upgrade/autoremove/autoclean")
+    log("Done.")
 
 def action_install_base_tools():
-    header("Install Baseline Tools (safe)")
+    header("Install Baseline Tools")
     run(["apt-get", "update"] + APT_OPTS)
     run(["apt-get", "install", "--no-install-recommends"] + APT_OPTS + BASE_PACKAGES)
-    log("Done: installed baseline packages")
+    log("Done.")
 
 def action_unattended_upgrades():
-    header("Enable Unattended Security Updates (safe)")
+    header("Enable Automatic Security Updates")
     run(["apt-get", "update"] + APT_OPTS)
     run(["apt-get", "install"] + APT_OPTS + ["unattended-upgrades"])
 
@@ -155,10 +172,10 @@ APT::Periodic::Unattended-Upgrade "1";
             )
 
     run(["systemctl", "enable", "--now", "unattended-upgrades"], check=False)
-    log("Done: unattended upgrades enabled (no auto-reboot)")
+    log("Done.")
 
 def action_journald_limits():
-    header("Limit Journald Disk Usage (safe)")
+    header("Limit System Logs (journald)")
     os.makedirs("/etc/systemd/journald.conf.d", exist_ok=True)
     cfg = """[Journal]
 SystemMaxUse=200M
@@ -172,20 +189,20 @@ Compress=yes
     run(["systemctl", "restart", "systemd-journald"], check=False)
     run(["journalctl", "--vacuum-time=14d"], check=False)
     run(["journalctl", "--vacuum-size=200M"], check=False)
-    log("Done: journald limited + vacuum applied")
+    log("Done.")
 
 def action_enable_fstrim():
-    header("Enable fstrim.timer (safe)")
+    header("Enable SSD Trim (fstrim.timer)")
     res = subprocess.run(["systemctl", "list-unit-files"], capture_output=True, text=True)
     if "fstrim.timer" in (res.stdout or ""):
         run(["systemctl", "enable", "--now", "fstrim.timer"], check=False)
-        log("Done: fstrim.timer enabled")
+        log("Done.")
     else:
-        log("Skip: fstrim.timer not available on this system")
+        log("Skip: fstrim.timer not available.")
 
 def action_sysctl_hardening():
-    header("Apply Safe sysctl Hardening (conservative)")
-    cfg = """# Conservative hardening defaults (widely safe)
+    header("Sysctl Hardening")
+    cfg = """# Conservative hardening defaults
 
 net.ipv4.conf.all.rp_filter=1
 net.ipv4.conf.default.rp_filter=1
@@ -216,7 +233,7 @@ kernel.dmesg_restrict=1
         f.write(cfg)
 
     run(["sysctl", "--system"], check=False)
-    log("Done: sysctl hardening applied")
+    log("Done.")
 
 def kernel_supports_bbr() -> bool:
     try:
@@ -229,20 +246,23 @@ def kernel_supports_bbr() -> bool:
         return False
 
 def action_network_bbr():
-    header("Network Optimization + Enable BBR (safe defaults)")
+    header("BBR Network Tuning")
     if not kernel_supports_bbr():
-        log("BBR not available in this kernel. Skipping BBR enable.")
+        log("BBR not available in this kernel. Skipping.")
         return
 
-    cfg = """# Safe network tuning: BBR + fq pacing + sane buffers (Ubuntu 20-24)
+    cfg = """# BBR + fq pacing + sane buffers
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
+
 net.core.rmem_max=8388608
 net.core.wmem_max=8388608
 net.ipv4.tcp_rmem=4096 87380 8388608
 net.ipv4.tcp_wmem=4096 65536 8388608
+
 net.core.somaxconn=1024
 net.ipv4.tcp_max_syn_backlog=2048
+
 net.ipv4.ip_local_port_range=10240 65535
 net.ipv4.tcp_mtu_probing=1
 """
@@ -251,22 +271,22 @@ net.ipv4.tcp_mtu_probing=1
         f.write(cfg)
 
     run(["sysctl", "--system"], check=False)
-    log("Done: BBR enabled + safe network tuning applied")
+    log("Done.")
 
 def action_create_swap():
-    header("RAM Expand (Swapfile) - Safe Opt-in")
+    header("Create Swap (RAM expand)")
     show = subprocess.run(["swapon", "--show"], capture_output=True, text=True)
     if (show.stdout or "").strip():
         log("Swap already active. Skipping.")
         return
 
-    size_gb = input("Swap size in GB (recommended 2 for small VPS, 0 to cancel): ").strip()
+    size_gb = input("Swap size in GB (example: 2, 0 cancels): ").strip()
     if not size_gb.isdigit():
         log("Invalid input. Cancelled.")
         return
     size_gb_int = int(size_gb)
     if size_gb_int <= 0:
-        log("Cancelled swap creation.")
+        log("Cancelled.")
         return
 
     swapfile = "/swapfile"
@@ -287,10 +307,10 @@ def action_create_swap():
         with open("/etc/fstab", "a", encoding="utf-8") as f:
             f.write("\n/swapfile none swap sw 0 0\n")
 
-    log("Done: swap enabled and persisted in /etc/fstab")
+    log("Done.")
 
 def action_report():
-    header("Server Report (boot, disk, memory, slow services)")
+    header("System Report")
     cmds = [
         ["uname", "-a"],
         ["df", "-hT", "/"],
@@ -302,16 +322,16 @@ def action_report():
         run(c, check=False)
         print()
 
-    log("Top 15 slow boot units:")
+    log("Slow boot units:")
     run(["bash", "-lc", "systemd-analyze blame | head -n 15"], check=False)
     log(f"Log file: {LOG_FILE}")
 
 def action_release_upgrade_manual():
-    header("Ubuntu Release Upgrade (MANUAL / interactive only)")
+    header("Ubuntu Release Upgrade (Manual)")
     name, ver = detect_ubuntu()
 
     if "Ubuntu" not in name:
-        log("This helper is for Ubuntu only. Skipping.")
+        log("Ubuntu only. Skipping.")
         return
 
     if ver.startswith("20."):
@@ -319,31 +339,32 @@ def action_release_upgrade_manual():
     elif ver.startswith("22."):
         target = "24.04 LTS"
     elif ver.startswith("24."):
-        log("You are already on Ubuntu 24.x. No upgrade target available.")
+        log("Already on Ubuntu 24.x. Nothing to do.")
         return
     else:
-        log(f"Unsupported Ubuntu version detected: {ver}")
+        log(f"Unsupported Ubuntu version: {ver}")
         return
 
     print(f"{YELLOW}Detected:{RESET} Ubuntu {ver}")
     print(f"{YELLOW}Target:{RESET}   {target}\n")
-    print(f"{DIM}This runs do-release-upgrade and MUST be supervised.{RESET}\n")
+    print(f"{DIM}This is interactive and must be supervised (tmux/screen + snapshot recommended).{RESET}\n")
 
-    ans = input("Type YES to start the interactive upgrade: ").strip()
+    ans = input("Type YES to start: ").strip()
     if ans != "YES":
-        log("Cancelled release upgrade.")
+        log("Cancelled.")
         return
 
     run(["apt-get", "update"] + APT_OPTS)
     run(["apt-get", "install"] + APT_OPTS + ["update-manager-core"])
-    log("Pre-upgrade: fully updating first...")
+    log("Pre-upgrade update...")
     action_update_upgrade_cleanup()
+
     run(["do-release-upgrade", "-c"], check=False)
-    log("Starting do-release-upgrade (interactive)...")
+    log("Starting do-release-upgrade...")
     run(["do-release-upgrade"], check=False)
 
 def action_run_all():
-    header("RUN ALL (safe baseline + optional extras)")
+    header("Run Everything")
     action_update_upgrade_cleanup()
     action_install_base_tools()
     action_unattended_upgrades()
@@ -351,49 +372,48 @@ def action_run_all():
     action_journald_limits()
     action_sysctl_hardening()
 
-    ans = input("Enable BBR + safe network tuning? (y/N): ").strip().lower()
+    ans = input("Enable BBR? (y/N): ").strip().lower()
     if ans == "y":
         action_network_bbr()
 
-    ans = input("Create swap (RAM expand)? (y/N): ").strip().lower()
+    ans = input("Create swap? (y/N): ").strip().lower()
     if ans == "y":
         action_create_swap()
 
     action_update_upgrade_cleanup()
     action_report()
-    log("Done: RUN ALL completed. (Release upgrade stays manual: option 11)")
+    log("Done. (Release upgrade stays manual)")
 
 # ----------------------- Menu -----------------------
 def menu():
     while True:
-        clear_screen()
-        name, ver = detect_ubuntu()
+        os_name, os_ver = detect_ubuntu()
+        print_menu_header(os_name, os_ver)
 
-        title = f"{GREEN}Ubuntu Tweaker{RESET}  {DIM}(safe menu • Ubuntu 20/22/24){RESET}"
-        meta = f"{DIM}OS:{RESET} {name} {ver}   {DIM}Log:{RESET} {LOG_FILE}"
+        print(f"{BOLD}{WHITE}Maintenance{RESET}")
+        print(menu_item("1", "Update + upgrade + cleanup"))
+        print(menu_item("2", "Install baseline tools"))
+        print(menu_item("3", "Enable automatic security updates"))
+        print(menu_item("4", "Limit system logs (journald)"))
+        print(menu_item("5", "Enable SSD trim (fstrim)"))
+        print()
 
-        lines = [
-            meta,
-            "",
-            f"{CYAN}  1){RESET} Update + full-upgrade + cleanup",
-            f"{CYAN}  2){RESET} Install baseline tools (curl/jq/htop/ncdu...)",
-            f"{CYAN}  3){RESET} Enable unattended security updates",
-            f"{CYAN}  4){RESET} Limit journald disk usage (prevent log bloat)",
-            f"{CYAN}  5){RESET} Enable fstrim.timer (SSD maintenance)",
-            f"{CYAN}  6){RESET} Apply safe sysctl hardening",
-            f"{CYAN}  7){RESET} Network optimization + enable BBR (safe defaults)",
-            f"{CYAN}  8){RESET} RAM expand (create swapfile)  {DIM}[opt-in]{RESET}",
-            f"{CYAN}  9){RESET} Report (boot time, disk, RAM, slow services)",
-            f"{CYAN} 10){RESET} RUN ALL (safe baseline + optional prompts)",
-            f"{YELLOW} 11){RESET} Ubuntu release upgrade  {DIM}(manual / interactive only){RESET}",
-            "",
-            f"{MAGENTA}  0){RESET} Exit",
-        ]
+        print(f"{BOLD}{WHITE}Tuning{RESET}")
+        print(menu_item("6", "Sysctl hardening"))
+        print(menu_item("7", "Enable BBR network tuning"))
+        print(menu_item("8", "Create swap (RAM expand)"))
+        print()
 
-        print_box(title, lines, width=80)
+        print(f"{BOLD}{WHITE}Tools{RESET}")
+        print(menu_item("9", "System report"))
+        print(menu_item("A", "Run everything", "asks for BBR/swap"))
+        print(menu_item("U", "Ubuntu release upgrade", "manual / interactive"))
+        print()
 
-        choice = input(f"\n{BOLD}Select:{RESET} ").strip().lower()
-        if choice in ("0", "q", "quit", "exit"):
+        print(f"{DIM}{hr('─')}{RESET}")
+        choice = input(f"{BOLD}Select{RESET} {DIM}(1-9, A, U, Q){RESET}: ").strip().lower()
+
+        if choice in ("q", "quit", "0", "exit"):
             clear_screen()
             log("Exit.")
             return
@@ -409,8 +429,8 @@ def menu():
             elif choice == "7": action_network_bbr()
             elif choice == "8": action_create_swap()
             elif choice == "9": action_report()
-            elif choice == "10": action_run_all()
-            elif choice == "11": action_release_upgrade_manual()
+            elif choice == "a": action_run_all()
+            elif choice == "u": action_release_upgrade_manual()
             else:
                 print(f"{RED}Invalid choice.{RESET}")
         except subprocess.CalledProcessError as e:
