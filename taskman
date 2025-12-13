@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 # taskman — clean black UI task manager (Ubuntu 20/22/24, Python 3.8+)
 #
-# Keys (also clickable with mouse on bottom bar in most terminals):
+# Keys:
 #   ↑↓            Select
-#   PgUp/PgDn     Jump
+#   PgUp/PgDn     Jump selection
+#   Mouse wheel   Scroll list (does NOT change selection)
 #   Enter         Terminate (SIGTERM)
 #   K             Kill (SIGKILL)
 #   S             Sort (CPU → MEM → PID → NAME)   [manual only; NO auto resort]
 #   /             Filter
-#   R             Refresh now
+#   R             Refresh processes only (top stats already auto-update)
 #   Q             Exit
 #
 # Mouse:
 #   Left click on a process row: select
 #   Double left click: terminate
 #   Right click: kill
-#   Scroll wheel: up/down
 
 import os
 import sys
@@ -26,11 +26,10 @@ import signal
 
 REFRESH_SEC = 1.0
 JUMP_ROWS = 10
-PROCS_PANEL_ROWS = 11          # smaller vertical process section (you asked)
+PROCS_PANEL_ROWS = 12          # small vertical process section (you asked)
 MAX_PROCS_SCAN = 9000
 
-# MANUAL sorting only (your request)
-AUTO_RESORT = False
+AUTO_RESORT = False            # must stay stable unless you press S
 
 # -------------------- helpers --------------------
 
@@ -79,12 +78,16 @@ def human_bytes_dec(n):
 def human_rate_dec(nps):
     return f"{human_bytes_dec(nps)}/s"
 
-def meter_track(width, pct):
-    # show a visible track end (so you always see max)
+def meter_bracket(width, pct):
+    """
+    Looks like: [██████      ]
+    width = inner width (no brackets)
+    """
     pct = clamp(pct, 0.0, 100.0)
     fill = int(round((pct / 100.0) * width))
     fill = clamp(fill, 0, width)
-    return ("█" * fill) + ("·" * (width - fill))
+    inner = ("█" * fill) + (" " * (width - fill))
+    return "[" + inner + "]"
 
 def get_hostname():
     try:
@@ -141,7 +144,6 @@ def get_loadavg3():
 # -------------------- disk info (SSD/HDD + device/model) --------------------
 
 def _base_block(dev_path):
-    # /dev/sda2 -> sda ; /dev/vda1 -> vda ; /dev/nvme0n1p2 -> nvme0n1
     name = dev_path.strip().split("/")[-1]
     if name.startswith("nvme") and "p" in name:
         return name.split("p", 1)[0]
@@ -150,7 +152,6 @@ def _base_block(dev_path):
     return name
 
 def root_mount_info():
-    # return (device, fstype)
     dev = ""
     fstype = ""
     mounts = read_text("/proc/mounts", "")
@@ -168,12 +169,11 @@ def root_disk_hardware():
         return {"dev": dev or "?", "fstype": fstype or "?", "type": "?", "model": "?"}
 
     base = _base_block(dev)
-    # best effort: /sys/class/block/<base> points to /sys/devices/...
     rotational = read_first_line(f"/sys/class/block/{base}/queue/rotational", "")
     disk_type = "SSD" if rotational.strip() == "0" else "HDD" if rotational.strip() == "1" else "Disk"
     model = read_first_line(f"/sys/class/block/{base}/device/model", "")
     if not model:
-        model = read_first_line(f"/sys/class/block/{base}/device/name", "")  # sometimes on virt
+        model = read_first_line(f"/sys/class/block/{base}/device/name", "")
     if not model:
         model = base
 
@@ -186,7 +186,7 @@ def safe_addnstr(stdscr, y, x, s, n, attr=0):
         h, w = stdscr.getmaxyx()
         if y < 0 or y >= h or x < 0 or x >= w:
             return
-        maxn = max(0, min(n, w - x - 1))  # avoid last cell (prevents ERR)
+        maxn = max(0, min(n, w - x - 1))  # avoid last cell -> prevents ERR
         if maxn <= 0:
             return
         if attr:
@@ -371,10 +371,10 @@ def read_proc_cmd(pid):
 
 class TaskMan:
     def __init__(self):
-        self.sort_mode = "CPU"     # CPU, MEM, PID, NAME (manual only)
+        self.sort_mode = "MEM"     # default looks calmer than CPU on small VPS
         self.filter_text = ""
         self.selected = 0
-        self.scroll = 0
+        self.view_scroll = 0       # wheel scroll affects this only
 
         self.toast_msg = ""
         self.toast_until = 0.0
@@ -392,9 +392,9 @@ class TaskMan:
         self.prev_cpu_total_for_procs = 0
 
         self.sys = {}
-        self.procs_by_pid = {}   # pid -> proc dict with live metrics
-        self.order = []          # stable order (never auto-resorts)
-        self.view = []           # filtered + ordered list of proc dicts
+        self.procs_by_pid = {}
+        self.order = []
+        self.view = []
 
         self.host = get_hostname()
         self.os_name = get_os_pretty()
@@ -403,31 +403,27 @@ class TaskMan:
         self.cores = os.cpu_count() or 1
         self.disk_hw = root_disk_hardware()
 
-        self.footer_actions = [] # list of (x1,x2, action_name)
-
     def init_colors(self, stdscr):
         curses.start_color()
-        # force black bg (no use_default_colors)
+        # force black bg
         curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLACK)   # base
         curses.init_pair(2, curses.COLOR_CYAN, curses.COLOR_BLACK)    # headings
         curses.init_pair(3, curses.COLOR_MAGENTA, curses.COLOR_BLACK) # accents
         curses.init_pair(4, curses.COLOR_YELLOW, curses.COLOR_BLACK)  # highlight
         curses.init_pair(5, curses.COLOR_RED, curses.COLOR_BLACK)     # hot
         curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_WHITE)   # selected row
-        curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_BLACK)   # dim-like (term dependent)
-        curses.init_pair(8, curses.COLOR_GREEN, curses.COLOR_BLACK)   # ok
+        curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_BLACK)   # subtle
 
         stdscr.bkgd(" ", curses.color_pair(1))
         stdscr.erase()
 
-        # enable mouse
         try:
-            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+            curses.mousemask(curses.ALL_MOUSE_EVENTS)
             curses.mouseinterval(150)
         except Exception:
             pass
 
-    def toast(self, msg, secs=1.5):
+    def toast(self, msg, secs=1.4):
         self.toast_msg = msg
         self.toast_until = time.monotonic() + secs
 
@@ -461,7 +457,7 @@ class TaskMan:
         d_pct = (d_used / d_total * 100.0) if d_total else 0.0
 
         rx, tx = read_net_bytes_total()
-        dt2 = max(1.0, dt)  # calmer net numbers
+        dt2 = max(1.0, dt)
         if self.prev_rx:
             self.rx_rate = max(0.0, (rx - self.prev_rx) / dt2)
         if self.prev_tx:
@@ -490,19 +486,16 @@ class TaskMan:
             "tx_rate": self.tx_rate,
         }
 
-    # -------- stable process list (NO auto resort) --------
-
     def _apply_sort_once(self):
-        # produce a new stable order based on current metrics
         items = []
         for pid in self.order:
             p = self.procs_by_pid.get(pid)
             if p:
                 items.append(p)
 
-        # include new pids not in order yet
+        seen = set(self.order)
         for pid, p in self.procs_by_pid.items():
-            if pid not in set(self.order):
+            if pid not in seen:
                 items.append(p)
 
         if self.sort_mode == "MEM":
@@ -511,7 +504,7 @@ class TaskMan:
             items.sort(key=lambda x: x["pid"])
         elif self.sort_mode == "NAME":
             items.sort(key=lambda x: x["cmd"].lower())
-        else:  # CPU
+        else:
             items.sort(key=lambda x: (x["cpu"], x["mem"]), reverse=True)
 
         self.order = [p["pid"] for p in items]
@@ -522,7 +515,6 @@ class TaskMan:
         total_delta = max(1, cpu_total - self.prev_cpu_total_for_procs) if self.prev_cpu_total_for_procs else 1
         self.prev_cpu_total_for_procs = cpu_total
 
-        # update/add live metrics
         alive_set = set()
         ftxt = self.filter_text.lower().strip()
 
@@ -551,24 +543,19 @@ class TaskMan:
             }
             alive_set.add(pid)
 
-        # remove dead from dict + order
         for pid in list(self.procs_by_pid.keys()):
             if pid not in alive_set:
                 self.procs_by_pid.pop(pid, None)
+
         self.order = [pid for pid in self.order if pid in self.procs_by_pid]
 
-        # first-time order
         if not self.order:
             self.order = sorted(self.procs_by_pid.keys())
-
-            # apply sort once on first build to match default "CPU"
             self._apply_sort_once()
 
-        # if AUTO_RESORT enabled (not by default), re-apply; otherwise keep stable
         if AUTO_RESORT:
             self._apply_sort_once()
 
-        # build view list using stable order + filter
         view = []
         for pid in self.order:
             p = self.procs_by_pid.get(pid)
@@ -584,6 +571,10 @@ class TaskMan:
         if self.selected >= len(self.view):
             self.selected = max(0, len(self.view) - 1)
 
+        # keep scroll in bounds (but DO NOT auto-follow selection unless needed)
+        max_scroll = max(0, len(self.view) - 1)
+        self.view_scroll = clamp(self.view_scroll, 0, max_scroll)
+
     def kill_pid(self, pid, sig):
         try:
             os.kill(pid, sig)
@@ -597,7 +588,7 @@ class TaskMan:
 
     def dialog_filter(self, stdscr):
         h, w = stdscr.getmaxyx()
-        dw = min(72, max(48, w - 10))
+        dw = min(70, max(46, w - 10))
         dh = 5
         x = max(0, (w - dw) // 2)
         y = max(0, (h - dh) // 2)
@@ -642,15 +633,13 @@ class TaskMan:
         safe_addnstr(stdscr, 0, 2, ellipsize(left, w // 2), w // 2, curses.color_pair(2) | curses.A_BOLD)
         safe_addnstr(stdscr, 0, max(2, w - len(right) - 2), right, len(right), curses.color_pair(2))
 
-        # second line: split into two segments so "cores" never disappears
         left2 = f"{self.os_name}  •  Kernel {self.kernel}"
-        cpu_short = ellipsize(self.cpu_model, max(24, w // 2 - 12))
+        cpu_short = ellipsize(self.cpu_model, max(24, w // 2 - 14))
         right2 = f"{cpu_short}  •  Cores {self.cores}"
         safe_fill(stdscr, 1, 0, w, curses.color_pair(1))
         safe_addnstr(stdscr, 1, 2, ellipsize(left2, w - 4), w - 4, curses.color_pair(7))
         safe_addnstr(stdscr, 1, max(2, w - len(right2) - 2), right2, len(right2), curses.color_pair(7))
 
-        # toast line
         if self.toast_msg and time.monotonic() < self.toast_until:
             safe_fill(stdscr, 2, 0, w, curses.color_pair(1))
             safe_addnstr(stdscr, 2, 2, ellipsize(self.toast_msg, w - 4), w - 4, curses.color_pair(4) | curses.A_BOLD)
@@ -664,7 +653,6 @@ class TaskMan:
         ix, iy = x + 2, y + 2
         iw = w - 4
 
-        # small info rows above bars (you asked)
         mem_total = self.sys["mem_total"]
         swap_total = self.sys["swap_total"]
         disk_dev = self.disk_hw.get("dev", "?")
@@ -672,15 +660,14 @@ class TaskMan:
         disk_model = self.disk_hw.get("model", "?")
         fs = self.disk_hw.get("fstype", "?")
 
-        line_a = f"Memory: {human_bytes_dec(mem_total)}   •   Swap: {human_bytes_dec(swap_total)}"
-        line_b = f"Disk: {disk_type} {disk_model}   •   {disk_dev}   •   {fs}"
+        line_a = f"CPU Max: 100%  •  Memory: {human_bytes_dec(mem_total)}  •  Swap: {human_bytes_dec(swap_total)}"
+        line_b = f"Disk: {disk_type} {disk_model}  •  {disk_dev}  •  {fs}"
 
         safe_addnstr(stdscr, iy + 0, ix, ellipsize(line_a, iw), iw, curses.color_pair(7))
         safe_addnstr(stdscr, iy + 1, ix, ellipsize(line_b, iw), iw, curses.color_pair(7))
 
-        # bars area (compact width so they are NOT “wide as shit”)
-        bar_w = max(20, min(34, iw - 40))
-
+        # compact bars (not wide)
+        inner = max(18, min(28, iw - 48))  # inner width (no brackets)
         cpu_pct = self.sys["cpu_pct"]
         mem_used = self.sys["mem_used"]
         mem_pct = self.sys["mem_pct"]
@@ -691,18 +678,29 @@ class TaskMan:
 
         def row(label, pct, extra, row_y):
             safe_addnstr(stdscr, row_y, ix, f"{label:<3}", 3, curses.color_pair(3) | curses.A_BOLD)
-            safe_addnstr(stdscr, row_y, ix + 5, meter_track(bar_w, pct), bar_w, self.pct_color(pct))
-            safe_addnstr(stdscr, row_y, ix + 5 + bar_w + 2, f"{pct:5.1f}%", 7, curses.color_pair(7))
+            bar = meter_bracket(inner, pct)
+            safe_addnstr(stdscr, row_y, ix + 5, bar, len(bar), self.pct_color(pct))
+            safe_addnstr(stdscr, row_y, ix + 5 + len(bar) + 2, f"{pct:5.1f}%", 7, curses.color_pair(7))
             if extra:
-                safe_addnstr(stdscr, row_y, ix + 5 + bar_w + 10, extra, iw - (5 + bar_w + 10), curses.color_pair(1))
+                safe_addnstr(stdscr, row_y, ix + 5 + len(bar) + 10, extra, iw - (5 + len(bar) + 10), curses.color_pair(1))
 
-        # spacing between rows so they never look “merged”
         row("CPU", cpu_pct, "", iy + 3)
         row("MEM", mem_pct, f"{human_bytes_dec(mem_used)} | {human_bytes_dec(mem_total)}", iy + 5)
         row("DSK", d_pct, f"{human_bytes_dec(d_used)} | {human_bytes_dec(self.sys['disk_total'])}", iy + 7)
 
         net_line = f"NET  ↓ {human_rate_dec(rx)}   ↑ {human_rate_dec(tx)}"
         safe_addnstr(stdscr, iy + 9, ix, ellipsize(net_line, iw), iw, curses.color_pair(7))
+
+    def _ensure_selected_visible(self, rows_avail):
+        if self.selected < 0 or self.selected >= len(self.view):
+            return
+        if self.selected < self.view_scroll:
+            self.view_scroll = self.selected
+        if self.selected >= self.view_scroll + rows_avail:
+            self.view_scroll = self.selected - rows_avail + 1
+
+        max_scroll = max(0, len(self.view) - rows_avail)
+        self.view_scroll = clamp(self.view_scroll, 0, max_scroll)
 
     def draw_processes(self, stdscr, y, x, h, w):
         title = f"PROCESSES  •  sort {self.sort_mode.lower()}  •  filter {(self.filter_text or '—')}"
@@ -731,14 +729,14 @@ class TaskMan:
         rows_avail = max(1, h - 5)
         n = len(self.view)
 
-        if self.selected < self.scroll:
-            self.scroll = self.selected
-        if self.selected >= self.scroll + rows_avail:
-            self.scroll = self.selected - rows_avail + 1
-        self.scroll = clamp(self.scroll, 0, max(0, n - rows_avail))
+        max_scroll = max(0, n - rows_avail)
+        self.view_scroll = clamp(self.view_scroll, 0, max_scroll)
+
+        # keep selected visible when using keyboard/click
+        self._ensure_selected_visible(rows_avail)
 
         for i in range(rows_avail):
-            idx = self.scroll + i
+            idx = self.view_scroll + i
             yy = rows_y + i
             safe_fill(stdscr, yy, ix, iw, curses.color_pair(1))
             if idx >= n:
@@ -767,51 +765,38 @@ class TaskMan:
             safe_addnstr(stdscr, yy, ix + col_name + 1 + col_cpu + 1 + col_mem + 1 + col_pid + 1, user, col_user, row_attr)
 
     def draw_footer(self, stdscr, h, w):
-        # single-line footer, with key + label different colors, and clickable “buttons”
         safe_hline(stdscr, h - 2, 0, ord("─"), w, curses.color_pair(1))
         safe_fill(stdscr, h - 1, 0, w, curses.color_pair(1))
 
-        # build segments
-        segments = [
+        # one clean line (no clickable stuff)
+        key_attr = curses.color_pair(2) | curses.A_BOLD
+        text_attr = curses.color_pair(7)
+
+        parts = [
             ("Q", "Exit"),
-            ("R", "Refresh"),
+            ("R", "Refresh Proc"),
             ("S", "Sort"),
             ("/", "Filter"),
             ("Enter", "Terminate"),
             ("K", "Kill"),
+            ("Wheel", "Scroll"),
             ("PgUp/PgDn", "Jump"),
             ("↑↓", "Select"),
         ]
 
-        self.footer_actions = []
         x = 2
-        for key, label in segments:
-            seg = f"[{key}]"
-            seg2 = f" {label} "
-            if x + len(seg) + len(seg2) + 1 >= w - 2:
+        for k, label in parts:
+            segk = f"[{k}]"
+            segt = f" {label} "
+            if x + len(segk) + len(segt) + 1 >= w - 2:
                 break
-            # key
-            safe_addnstr(stdscr, h - 1, x, seg, len(seg), curses.color_pair(2) | curses.A_BOLD)
-            x1 = x
-            x += len(seg)
-            # label
-            safe_addnstr(stdscr, h - 1, x, seg2, len(seg2), curses.color_pair(7))
-            x2 = x + len(seg2) - 1
-            # separator
-            if x + len(seg2) + 1 < w - 2:
-                safe_addnstr(stdscr, h - 1, x2 + 1, "│", 1, curses.color_pair(1))
-            # map click range
-            action = label.lower()
-            self.footer_actions.append((x1, x2, action, key))
-            x = x2 + 3
-
-    # -------------------- input helpers --------------------
-
-    def _footer_click_action(self, mx):
-        for x1, x2, action, key in self.footer_actions:
-            if x1 <= mx <= x2:
-                return action, key
-        return None, None
+            safe_addnstr(stdscr, h - 1, x, segk, len(segk), key_attr)
+            x += len(segk)
+            safe_addnstr(stdscr, h - 1, x, segt, len(segt), text_attr)
+            x += len(segt)
+            if x < w - 2:
+                safe_addnstr(stdscr, h - 1, x, "│", 1, curses.color_pair(1))
+                x += 2
 
     def _cycle_sort(self):
         order = ["CPU", "MEM", "PID", "NAME"]
@@ -819,9 +804,7 @@ class TaskMan:
         self.sort_mode = order[(i + 1) % len(order)]
         self._apply_sort_once()
         self.refresh_processes()
-        self.toast(f"sort: {self.sort_mode.lower()}", 1.2)
-
-    # -------------------- loop --------------------
+        self.toast(f"sort: {self.sort_mode.lower()}")
 
     def run(self, stdscr):
         curses.curs_set(0)
@@ -832,23 +815,25 @@ class TaskMan:
         self.prev_cpu_total, self.prev_cpu_idle = read_cpu_total_idle()
         self.prev_rx, self.prev_tx = read_net_bytes_total()
 
-        last_refresh = time.monotonic()
-        dt_last = REFRESH_SEC
+        last_sys = time.monotonic()
+        last_proc = time.monotonic()
 
         self.refresh_system(REFRESH_SEC)
         self.refresh_processes()
-        need_redraw = True
 
         while True:
             now = time.monotonic()
 
-            if now - last_refresh >= REFRESH_SEC:
-                dt = now - last_refresh
-                last_refresh = now
-                dt_last = max(1.0, dt)
-                self.refresh_system(dt_last)
+            # system stats: always auto-update
+            if now - last_sys >= REFRESH_SEC:
+                dt = now - last_sys
+                last_sys = now
+                self.refresh_system(max(1.0, dt))
+
+            # processes: auto-update too (stable order; no auto resort)
+            if now - last_proc >= REFRESH_SEC:
+                last_proc = now
                 self.refresh_processes()
-                need_redraw = True
 
             ch = -1
             try:
@@ -860,183 +845,112 @@ class TaskMan:
                 if ch in (ord("q"), ord("Q")):
                     return
 
+                # R: refresh processes ONLY
                 if ch in (ord("r"), ord("R")):
-                    self.refresh_system(max(1.0, dt_last))
                     self.refresh_processes()
-                    self.toast("refreshed", 1.0)
-                    need_redraw = True
-
+                    self.toast("processes refreshed")
                 elif ch in (ord("s"), ord("S")):
-                    # manual sort only
                     self._cycle_sort()
-                    need_redraw = True
-
                 elif ch == ord("/"):
                     s = self.dialog_filter(stdscr)
                     if s is not None:
                         self.filter_text = s
                         self.selected = 0
-                        self.scroll = 0
+                        self.view_scroll = 0
                         self.refresh_processes()
-                        self.toast("filter set" if s else "filter cleared", 1.2)
-                        need_redraw = True
-
+                        self.toast("filter set" if s else "filter cleared")
                 elif ch == curses.KEY_UP:
                     if self.selected > 0:
                         self.selected -= 1
-                        need_redraw = True
-
                 elif ch == curses.KEY_DOWN:
                     if self.selected < max(0, len(self.view) - 1):
                         self.selected += 1
-                        need_redraw = True
-
                 elif ch == curses.KEY_PPAGE:
                     self.selected = max(0, self.selected - JUMP_ROWS)
-                    need_redraw = True
-
                 elif ch == curses.KEY_NPAGE:
                     self.selected = min(max(0, len(self.view) - 1), self.selected + JUMP_ROWS)
-                    need_redraw = True
-
                 elif ch in (10, 13, curses.KEY_ENTER):
                     if self.view:
                         pid = self.view[self.selected]["pid"]
                         ok, err = self.kill_pid(pid, signal.SIGTERM)
-                        self.toast("terminated" if ok else f"failed: {err}", 1.4)
+                        self.toast("terminated" if ok else f"failed: {err}")
                         self.refresh_processes()
-                        need_redraw = True
-
                 elif ch in (ord("k"), ord("K")):
                     if self.view:
                         pid = self.view[self.selected]["pid"]
                         ok, err = self.kill_pid(pid, signal.SIGKILL)
-                        self.toast("killed" if ok else f"failed: {err}", 1.4)
+                        self.toast("killed" if ok else f"failed: {err}")
                         self.refresh_processes()
-                        need_redraw = True
-
                 elif ch == curses.KEY_MOUSE:
                     try:
                         _, mx, my, _, bstate = curses.getmouse()
                     except Exception:
                         mx = my = bstate = 0
 
+                    # wheel scroll should NOT change selection
+                    if bstate & getattr(curses, "BUTTON4_PRESSED", 0):
+                        self.view_scroll = max(0, self.view_scroll - 1)
+                    if bstate & getattr(curses, "BUTTON5_PRESSED", 0):
+                        self.view_scroll = self.view_scroll + 1  # clamped in draw
+
+                    # clicks in process area select/kill/terminate
                     h, w = stdscr.getmaxyx()
-                    # footer clicks
-                    if my == h - 1:
-                        action, key = self._footer_click_action(mx)
-                        if action == "exit":
-                            return
-                        if action == "refresh":
-                            self.refresh_system(max(1.0, dt_last))
-                            self.refresh_processes()
-                            self.toast("refreshed", 1.0)
-                            need_redraw = True
-                        if action == "sort":
-                            self._cycle_sort()
-                            need_redraw = True
-                        if action == "filter":
-                            s = self.dialog_filter(stdscr)
-                            if s is not None:
-                                self.filter_text = s
-                                self.selected = 0
-                                self.scroll = 0
-                                self.refresh_processes()
-                                self.toast("filter set" if s else "filter cleared", 1.2)
-                                need_redraw = True
-                        if action == "terminate":
-                            if self.view:
+                    perf_h = 13
+                    proc_y = 3 + perf_h + 1
+                    proc_x = 2
+                    proc_h = PROCS_PANEL_ROWS
+                    proc_w = w - 4
+
+                    if self.view and (proc_y <= my < proc_y + proc_h) and (proc_x <= mx < proc_x + proc_w):
+                        row0 = proc_y + 4  # header+line offset
+                        idx = self.view_scroll + (my - row0)
+                        if 0 <= (my - row0) and idx < len(self.view):
+                            if bstate & getattr(curses, "BUTTON1_CLICKED", 0):
+                                self.selected = idx
+                            if bstate & getattr(curses, "BUTTON1_DOUBLE_CLICKED", 0):
+                                self.selected = idx
                                 pid = self.view[self.selected]["pid"]
                                 ok, err = self.kill_pid(pid, signal.SIGTERM)
-                                self.toast("terminated" if ok else f"failed: {err}", 1.4)
+                                self.toast("terminated" if ok else f"failed: {err}")
                                 self.refresh_processes()
-                                need_redraw = True
-                        if action == "kill":
-                            if self.view:
+                            if bstate & getattr(curses, "BUTTON3_CLICKED", 0):
+                                self.selected = idx
                                 pid = self.view[self.selected]["pid"]
                                 ok, err = self.kill_pid(pid, signal.SIGKILL)
-                                self.toast("killed" if ok else f"failed: {err}", 1.4)
+                                self.toast("killed" if ok else f"failed: {err}")
                                 self.refresh_processes()
-                                need_redraw = True
 
-                    # wheel scroll
-                    if bstate & getattr(curses, "BUTTON4_PRESSED", 0):
-                        self.selected = max(0, self.selected - 1)
-                        need_redraw = True
-                    if bstate & getattr(curses, "BUTTON5_PRESSED", 0):
-                        self.selected = min(max(0, len(self.view) - 1), self.selected + 1)
-                        need_redraw = True
+            # draw
+            h, w = stdscr.getmaxyx()
+            stdscr.erase()
 
-                    # click in process area to select / kill
-                    # we detect by checking if click is within processes box rows
-                    if self.view:
-                        # heuristic: processes box starts after performance box
-                        # (we redraw using constants, so keep aligned)
-                        perf_h = 13
-                        proc_y = 3 + perf_h + 1
-                        proc_x = 2
-                        proc_h = PROCS_PANEL_ROWS
-                        proc_w = w - 4
-
-                        if proc_y <= my < proc_y + proc_h and proc_x <= mx < proc_x + proc_w:
-                            # rows start at (proc_y + 2 + 2) = proc_y+4 (header + line)
-                            row0 = proc_y + 4
-                            idx = self.scroll + (my - row0)
-                            if 0 <= (my - row0) and idx < len(self.view):
-                                self.selected = idx
-                                need_redraw = True
-
-                                # double click terminate
-                                if bstate & getattr(curses, "BUTTON1_DOUBLE_CLICKED", 0):
-                                    pid = self.view[self.selected]["pid"]
-                                    ok, err = self.kill_pid(pid, signal.SIGTERM)
-                                    self.toast("terminated" if ok else f"failed: {err}", 1.4)
-                                    self.refresh_processes()
-                                    need_redraw = True
-
-                                # right click kill
-                                if bstate & getattr(curses, "BUTTON3_CLICKED", 0):
-                                    pid = self.view[self.selected]["pid"]
-                                    ok, err = self.kill_pid(pid, signal.SIGKILL)
-                                    self.toast("killed" if ok else f"failed: {err}", 1.4)
-                                    self.refresh_processes()
-                                    need_redraw = True
-
-            toast_visible = self.toast_msg and (time.monotonic() < self.toast_until)
-            if need_redraw or toast_visible:
-                h, w = stdscr.getmaxyx()
-                stdscr.erase()
-
-                if h < 28 or w < 110:
-                    msg = "Resize terminal (recommended >= 110x28)."
-                    safe_addnstr(stdscr, 0, 2, msg, w - 4, curses.color_pair(2) | curses.A_BOLD)
-                    stdscr.refresh()
-                    time.sleep(0.06)
-                    continue
-
-                self.draw_header(stdscr, w)
-
-                perf_h = 13
-                perf_y = 3
-                perf_x = 2
-                perf_w = w - 4
-                self.draw_performance(stdscr, perf_y, perf_x, perf_h, perf_w)
-
-                proc_h = PROCS_PANEL_ROWS
-                proc_y = perf_y + perf_h + 1
-                proc_x = 2
-                proc_w = w - 4
-                self.draw_processes(stdscr, proc_y, proc_x, proc_h, proc_w)
-
-                self.draw_footer(stdscr, h, w)
-
+            if h < 28 or w < 110:
+                safe_addnstr(stdscr, 0, 2, "Resize terminal (recommended >= 110x28).", w - 4, curses.color_pair(2) | curses.A_BOLD)
                 stdscr.refresh()
-                need_redraw = False
+                time.sleep(0.06)
+                continue
 
+            self.draw_header(stdscr, w)
+
+            perf_h = 13
+            perf_y = 3
+            perf_x = 2
+            perf_w = w - 4
+            self.draw_performance(stdscr, perf_y, perf_x, perf_h, perf_w)
+
+            proc_h = PROCS_PANEL_ROWS
+            proc_y = perf_y + perf_h + 1
+            proc_x = 2
+            proc_w = w - 4
+            self.draw_processes(stdscr, proc_y, proc_x, proc_h, proc_w)
+
+            self.draw_footer(stdscr, h, w)
+
+            stdscr.refresh()
             time.sleep(0.03)
 
 def main():
-    # try to force real black background (helps on some terminals)
+    # try to force black background on startup (helps on some terminals)
     try:
         sys.stdout.write("\033[40m\033[2J\033[H")
         sys.stdout.flush()
