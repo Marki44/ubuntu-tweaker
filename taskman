@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
-# taskman — a cleaner, Windows-Task-Manager-style TUI (no btop/htop/glances)
-# Ubuntu 20/22/24 | Python 3.8+ | Reads /proc | Arrow-select + kill without typing PID
+# taskman — low-CPU, cleaner "Task Manager"-style TUI (no external apps)
+# Ubuntu 20/22/24 | Python 3.8+ | Reads /proc | Arrow-select + End Task (no typing PID)
+#
+# Changes vs older version:
+# - Updates once per second (configurable) to prevent CPU spikes while scrolling
+# - Redraws only when needed (key press or refresh tick)
+# - Much lighter per-refresh work (per-proc IO is computed only for visible rows)
+# - Cleaner summary: shows Used / Total + percent (memory/disk) + net rates
+# - Colors avoid "terminal green"
 
 import os
 import time
@@ -8,7 +15,8 @@ import curses
 import shutil
 import signal
 
-HZ = os.sysconf(os.sysconf_names.get("SC_CLK_TCK", "SC_CLK_TCK"))
+REFRESH_SEC = 1.0          # stats update interval (seconds)
+MAX_VISIBLE_IO = 24        # how many visible rows to compute /proc/[pid]/io for
 
 # -------------------- small utils --------------------
 
@@ -46,9 +54,6 @@ def human_bytes(n):
 def human_rate(n_per_s):
     return f"{human_bytes(n_per_s)}/s"
 
-def pct_str(p):
-    return f"{p:>5.1f}%"
-
 def ellipsize(s, maxw):
     if maxw <= 0:
         return ""
@@ -57,14 +62,6 @@ def ellipsize(s, maxw):
     if maxw <= 1:
         return s[:maxw]
     return s[: maxw - 1] + "…"
-
-SPARKS = "▁▂▃▄▅▆▇█"
-def spark(val, vmax=100.0):
-    if vmax <= 0:
-        return SPARKS[0]
-    p = clamp(val / vmax, 0.0, 1.0)
-    idx = int(round(p * (len(SPARKS) - 1)))
-    return SPARKS[idx]
 
 def draw_box(stdscr, y, x, h, w, title=None, color=0):
     if h < 2 or w < 2:
@@ -88,6 +85,12 @@ def draw_box(stdscr, y, x, h, w, title=None, color=0):
             stdscr.attroff(color)
     except Exception:
         pass
+
+def bar(width, pct):
+    pct = clamp(pct, 0.0, 100.0)
+    filled = int(round((pct / 100.0) * width))
+    filled = clamp(filled, 0, width)
+    return "█" * filled + " " * (width - filled)
 
 # -------------------- system stats --------------------
 
@@ -148,52 +151,16 @@ def read_net_bytes_total():
             pass
     return rx, tx
 
-def pick_main_disk_name():
-    # pick first real disk name from /proc/diskstats: nvme0n1, vda, sda, etc.
-    txt = read_text("/proc/diskstats", "")
-    for line in txt.splitlines():
-        parts = line.split()
-        if len(parts) < 14:
-            continue
-        name = parts[2]
-        if name.startswith(("loop", "ram")):
-            continue
-        # ignore partitions like sda1, vda2, nvme0n1p1
-        if name[-1].isdigit():
-            # nvme partitions include 'p1'
-            if "nvme" in name and "p" in name:
-                continue
-            # sda1 etc.
-            continue
-        return name
-    return ""
-
-def read_disk_sectors(name):
-    if not name:
-        return 0, 0
-    txt = read_text("/proc/diskstats", "")
-    for line in txt.splitlines():
-        parts = line.split()
-        if len(parts) < 14:
-            continue
-        if parts[2] != name:
-            continue
-        # sectors_read at index 5, sectors_written at index 9 (based on kernel doc)
-        try:
-            sectors_read = int(parts[5])
-            sectors_written = int(parts[9])
-            return sectors_read, sectors_written
-        except Exception:
-            return 0, 0
-    return 0, 0
-
 # -------------------- process stats --------------------
 
 def list_pids():
     out = []
-    for name in os.listdir("/proc"):
-        if name.isdigit():
-            out.append(int(name))
+    try:
+        for name in os.listdir("/proc"):
+            if name.isdigit():
+                out.append(int(name))
+    except Exception:
+        return []
     return out
 
 def read_proc_stat_ticks(pid):
@@ -204,7 +171,6 @@ def read_proc_stat_ticks(pid):
     if r == -1:
         return None
     after = s[r + 2 :].split()
-    # utime/stime in after: 11,12
     if len(after) < 13:
         return None
     try:
@@ -293,8 +259,7 @@ TAB_PERF      = 1
 class TaskMan:
     def __init__(self):
         self.tab = TAB_PROCESSES
-
-        self.sort_mode = "CPU"  # CPU / MEM / DISK
+        self.sort_mode = "CPU"   # CPU / MEM
         self.filter_text = ""
 
         self.selected = 0
@@ -303,43 +268,35 @@ class TaskMan:
         self.toast_msg = ""
         self.toast_until = 0.0
 
-        # deltas
+        # system deltas
         self.prev_cpu_total = 0
         self.prev_cpu_idle = 0
         self.cpu_pct = 0.0
 
         self.prev_rx = 0
         self.prev_tx = 0
+        self.rx_rate = 0.0
+        self.tx_rate = 0.0
 
-        self.disk_name = pick_main_disk_name()
-        self.prev_dsr = 0
-        self.prev_dsw = 0
+        # process CPU deltas
+        self.prev_proc_ticks = {}  # pid -> ticks
+        self.prev_cpu_total_for_procs = 0
 
-        self.prev_proc_ticks = {}   # pid -> ticks
-        self.prev_proc_io = {}      # pid -> (rb, wb)
+        # per-proc IO deltas (only for visible rows)
+        self.prev_proc_io = {}     # pid -> (rb, wb)
+        self.io_bps_cache = {}     # pid -> io_bps (last refresh)
 
-        # history for perf tab
-        self.hist_cpu = []
-        self.hist_mem = []
-        self.hist_dsk = []
-        self.hist_rx  = []
-        self.hist_tx  = []
-        self.hist_len = 60
+        # cached data used for draw (only changes each refresh tick)
+        self.sysinfo = {
+            "mem_total": 0, "mem_used": 0, "mem_pct": 0.0,
+            "disk_total": 0, "disk_used": 0, "disk_pct": 0.0,
+            "load": ("0", "0", "0"),
+        }
+        self.procs = []  # list of dicts
 
     def toast(self, msg, secs=2.0):
         self.toast_msg = msg
-        self.toast_until = time.time() + secs
-
-    def kill_selected(self, pid, sig):
-        try:
-            os.kill(pid, sig)
-            return True, ""
-        except PermissionError:
-            return False, "permission denied"
-        except ProcessLookupError:
-            return False, "no such process"
-        except Exception as e:
-            return False, str(e)
+        self.toast_until = time.monotonic() + secs
 
     def calc_system(self, dt):
         # CPU %
@@ -350,61 +307,40 @@ class TaskMan:
             self.cpu_pct = clamp((1.0 - (d_idle / d_total)) * 100.0, 0.0, 100.0)
         self.prev_cpu_total, self.prev_cpu_idle = total, idle
 
-        # Mem %
+        # Mem (used/total)
         mi = read_meminfo_kb()
-        total_kb = mi.get("MemTotal", 0)
-        avail_kb = mi.get("MemAvailable", 0)
-        used_kb = max(0, total_kb - avail_kb)
-        mem_pct = (used_kb / total_kb * 100.0) if total_kb else 0.0
+        mem_total_kb = mi.get("MemTotal", 0)
+        mem_avail_kb = mi.get("MemAvailable", 0)
+        mem_used_kb = max(0, mem_total_kb - mem_avail_kb)
+        mem_pct = (mem_used_kb / mem_total_kb * 100.0) if mem_total_kb else 0.0
 
-        # Disk %
-        d_total, d_used, d_free = disk_usage_root()
-        disk_pct = (d_used / d_total * 100.0) if d_total else 0.0
+        # Disk (used/total)
+        d_total, d_used, _ = disk_usage_root()
+        d_pct = (d_used / d_total * 100.0) if d_total else 0.0
 
-        # Net rate
+        # Net rates
         rx, tx = read_net_bytes_total()
-        rx_rate = (rx - self.prev_rx) / dt if self.prev_rx else 0.0
-        tx_rate = (tx - self.prev_tx) / dt if self.prev_tx else 0.0
+        if self.prev_rx:
+            self.rx_rate = max(0.0, (rx - self.prev_rx) / dt)
+        if self.prev_tx:
+            self.tx_rate = max(0.0, (tx - self.prev_tx) / dt)
         self.prev_rx, self.prev_tx = rx, tx
 
-        # Disk IO rate (best effort)
-        sr, sw = read_disk_sectors(self.disk_name)
-        # sectors are typically 512 bytes
-        dsr = (sr - self.prev_dsr) * 512 / dt if self.prev_dsr else 0.0
-        dsw = (sw - self.prev_dsw) * 512 / dt if self.prev_dsw else 0.0
-        self.prev_dsr, self.prev_dsw = sr, sw
-
-        # history
-        self.hist_cpu.append(self.cpu_pct)
-        self.hist_mem.append(mem_pct)
-        self.hist_dsk.append(disk_pct)
-        self.hist_rx.append(rx_rate)
-        self.hist_tx.append(tx_rate)
-        for arr in (self.hist_cpu, self.hist_mem, self.hist_dsk, self.hist_rx, self.hist_tx):
-            if len(arr) > self.hist_len:
-                del arr[0:len(arr) - self.hist_len]
-
-        return {
-            "mem_total_kb": total_kb,
-            "mem_used_kb": used_kb,
+        self.sysinfo = {
+            "mem_total": mem_total_kb * 1024,
+            "mem_used": mem_used_kb * 1024,
             "mem_pct": mem_pct,
             "disk_total": d_total,
             "disk_used": d_used,
-            "disk_pct": disk_pct,
-            "rx_rate": rx_rate,
-            "tx_rate": tx_rate,
-            "dsr": dsr,
-            "dsw": dsw,
+            "disk_pct": d_pct,
+            "load": get_loadavg3(),
         }
 
     def build_processes(self, dt):
         pids = list_pids()
-
-        # total ticks delta for CPU% calculation
         cpu_total, _ = read_cpu_total_idle()
-        prev_cpu_total = getattr(self, "_prev_cpu_total_for_procs", 0)
-        total_delta = max(1, cpu_total - prev_cpu_total) if prev_cpu_total else 1
-        self._prev_cpu_total_for_procs = cpu_total
+        total_delta = max(1, cpu_total - self.prev_cpu_total_for_procs) if self.prev_cpu_total_for_procs else 1
+        self.prev_cpu_total_for_procs = cpu_total
 
         procs = []
         for pid in pids:
@@ -425,11 +361,6 @@ class TaskMan:
 
             cmd = read_proc_cmd(pid)
 
-            rb, wb = read_proc_io_bytes(pid)
-            prb, pwb = self.prev_proc_io.get(pid, (rb, wb))
-            self.prev_proc_io[pid] = (rb, wb)
-            io_rate = ((max(0, rb - prb) + max(0, wb - pwb)) / dt) if dt else 0.0  # bytes/s
-
             if self.filter_text:
                 f = self.filter_text.lower()
                 if f not in cmd.lower() and f not in user.lower() and f not in str(pid):
@@ -441,25 +372,46 @@ class TaskMan:
                 "cpu": cpu_pct,
                 "mem_mb": mem_mb,
                 "cmd": cmd,
-                "io_bps": io_rate,
             })
 
-        # sort
         if self.sort_mode == "MEM":
             procs.sort(key=lambda x: (x["mem_mb"], x["cpu"]), reverse=True)
-        elif self.sort_mode == "DISK":
-            procs.sort(key=lambda x: (x["io_bps"], x["cpu"]), reverse=True)
         else:
             procs.sort(key=lambda x: (x["cpu"], x["mem_mb"]), reverse=True)
 
         if self.selected >= len(procs):
             self.selected = max(0, len(procs) - 1)
-        return procs
+
+        self.procs = procs
+
+        # refresh IO cache only for visible rows (done in draw when we know visible slice)
+        self.io_bps_cache = {}
+
+    def update_visible_io(self, visible_pids, dt):
+        # compute io_bps for visible PIDs only (cheap)
+        if dt <= 0:
+            dt = 1.0
+        for pid in visible_pids:
+            rb, wb = read_proc_io_bytes(pid)
+            prb, pwb = self.prev_proc_io.get(pid, (rb, wb))
+            self.prev_proc_io[pid] = (rb, wb)
+            io_bps = (max(0, rb - prb) + max(0, wb - pwb)) / dt
+            self.io_bps_cache[pid] = io_bps
+
+    def kill_pid(self, pid, sig):
+        try:
+            os.kill(pid, sig)
+            return True, ""
+        except PermissionError:
+            return False, "permission denied"
+        except ProcessLookupError:
+            return False, "no such process"
+        except Exception as e:
+            return False, str(e)
 
     # -------------------- dialogs --------------------
 
     def dialog_kill(self, stdscr, pid):
-        # selection dialog: Terminate / Kill / Cancel
         opts = [("Terminate", signal.SIGTERM), ("Kill", signal.SIGKILL), ("Cancel", None)]
         sel = 0
         h, w = stdscr.getmaxyx()
@@ -469,7 +421,7 @@ class TaskMan:
         x = (w - dw) // 2
 
         while True:
-            draw_box(stdscr, y, x, dh, dw, title="End task", color=curses.color_pair(3))
+            draw_box(stdscr, y, x, dh, dw, title="End task", color=curses.color_pair(2))
             stdscr.addnstr(y + 2, x + 2, f"Selected PID: {pid}", dw - 4)
             stdscr.addnstr(y + 3, x + 2, "Choose action:", dw - 4)
 
@@ -480,21 +432,24 @@ class TaskMan:
                     stdscr.addnstr(y + 5 + i, x + 2, ellipsize(line, dw - 4), dw - 4)
                     stdscr.attroff(curses.color_pair(6) | curses.A_BOLD)
                 else:
+                    stdscr.attron(curses.color_pair(5))
                     stdscr.addnstr(y + 5 + i, x + 2, ellipsize(line, dw - 4), dw - 4)
+                    stdscr.attroff(curses.color_pair(5))
 
+            stdscr.attron(curses.color_pair(1))
             stdscr.addnstr(y + dh - 2, x + 2, "Enter=Select   Esc=Cancel", dw - 4)
+            stdscr.attroff(curses.color_pair(1))
             stdscr.refresh()
 
             ch = stdscr.getch()
-            if ch in (27, ord("q"), ord("Q")):  # ESC
+            if ch in (27, ord("q"), ord("Q")):
                 return None
             if ch in (curses.KEY_UP, ord("k")):
                 sel = max(0, sel - 1)
             elif ch in (curses.KEY_DOWN, ord("j")):
                 sel = min(len(opts) - 1, sel + 1)
             elif ch in (curses.KEY_ENTER, 10, 13):
-                _, sig = opts[sel]
-                return sig
+                return opts[sel][1]
 
     def dialog_filter(self, stdscr):
         h, w = stdscr.getmaxyx()
@@ -508,19 +463,25 @@ class TaskMan:
         stdscr.nodelay(False)
 
         while True:
-            draw_box(stdscr, y, x, dh, dw, title="Filter", color=curses.color_pair(3))
+            draw_box(stdscr, y, x, dh, dw, title="Filter", color=curses.color_pair(2))
+            stdscr.attron(curses.color_pair(1))
             stdscr.addnstr(y + 2, x + 2, "Type to filter (Enter=apply, Esc=cancel)", dw - 4)
+            stdscr.attroff(curses.color_pair(1))
+
+            stdscr.attron(curses.color_pair(5))
             stdscr.addnstr(y + 4, x + 2, ">", 1)
             stdscr.addnstr(y + 4, x + 4, ellipsize(s, dw - 6), dw - 6)
+            stdscr.attroff(curses.color_pair(5))
+
             stdscr.move(y + 4, min(x + 4 + len(s), x + dw - 3))
             stdscr.refresh()
 
             ch = stdscr.getch()
-            if ch == 27:  # ESC
+            if ch == 27:
                 stdscr.nodelay(True)
                 curses.curs_set(0)
                 return None
-            if ch in (10, 13):  # Enter
+            if ch in (10, 13):
                 stdscr.nodelay(True)
                 curses.curs_set(0)
                 return s.strip()
@@ -532,117 +493,128 @@ class TaskMan:
     # -------------------- draw UI --------------------
 
     def draw_sidebar(self, stdscr, y, x, h, w):
-        draw_box(stdscr, y, x, h, w, title="Menu", color=curses.color_pair(2))
-        items = [
-            ("Processes", TAB_PROCESSES),
-            ("Performance", TAB_PERF),
-        ]
+        draw_box(stdscr, y, x, h, w, title="Menu", color=curses.color_pair(1))
+        items = [("Processes", TAB_PROCESSES), ("Performance", TAB_PERF)]
         for i, (name, tabid) in enumerate(items):
-            line_y = y + 2 + i
-            if line_y >= y + h - 2:
+            yy = y + 2 + i
+            if yy >= y + h - 2:
                 break
             if self.tab == tabid:
                 stdscr.attron(curses.color_pair(6) | curses.A_BOLD)
-                stdscr.addnstr(line_y, x + 2, ellipsize("• " + name, w - 4), w - 4)
+                stdscr.addnstr(yy, x + 2, ellipsize("• " + name, w - 4), w - 4)
                 stdscr.attroff(curses.color_pair(6) | curses.A_BOLD)
             else:
-                stdscr.addnstr(line_y, x + 2, ellipsize("  " + name, w - 4), w - 4)
+                stdscr.attron(curses.color_pair(5))
+                stdscr.addnstr(yy, x + 2, ellipsize("  " + name, w - 4), w - 4)
+                stdscr.attroff(curses.color_pair(5))
 
-        hint = [
+        hints = [
             "",
             "Keys",
             "  Tab  switch",
             "  ↑↓   select",
             "  K    end task",
-            "  /    filter",
             "  S    sort",
+            "  /    filter",
             "  Q    quit",
         ]
-        start = y + h - len(hint) - 1
-        for i, t in enumerate(hint):
+        start = y + h - len(hints) - 1
+        for i, t in enumerate(hints):
             yy = start + i
             if y + 1 <= yy < y + h - 1:
-                stdscr.attron(curses.color_pair(1))
+                stdscr.attron(curses.color_pair(2))
                 stdscr.addnstr(yy, x + 2, ellipsize(t, w - 4), w - 4)
-                stdscr.attroff(curses.color_pair(1))
+                stdscr.attroff(curses.color_pair(2))
 
-    def draw_top_summary(self, stdscr, y, x, h, w, sysinfo):
-        draw_box(stdscr, y, x, h, w, title="Summary", color=curses.color_pair(2))
+    def draw_summary(self, stdscr, y, x, h, w):
+        draw_box(stdscr, y, x, h, w, title="Summary", color=curses.color_pair(1))
 
-        cpu = self.cpu_pct
-        memp = sysinfo["mem_pct"]
-        dskp = sysinfo["disk_pct"]
-        rxr = sysinfo["rx_rate"]
-        txr = sysinfo["tx_rate"]
-        load1, load5, load15 = get_loadavg3()
+        mem_used = self.sysinfo["mem_used"]
+        mem_total = self.sysinfo["mem_total"]
+        mem_pct = self.sysinfo["mem_pct"]
 
-        # 4 tiles
-        colw = (w - 4) // 4 if w >= 40 else max(8, (w - 4) // 2)
+        d_used = self.sysinfo["disk_used"]
+        d_total = self.sysinfo["disk_total"]
+        d_pct = self.sysinfo["disk_pct"]
+
+        load1, load5, load15 = self.sysinfo["load"]
+
+        # layout: 4 tiles
+        inner_w = w - 4
+        tile_w = max(18, inner_w // 4)
+        tile_w = min(tile_w, 34)
 
         tiles = [
-            ("CPU", cpu, pct_str(cpu)),
-            ("Memory", memp, pct_str(memp)),
-            ("Disk", dskp, pct_str(dskp)),
-            ("Network", 0, f"↓{human_rate(rxr)} ↑{human_rate(txr)}"),
+            ("CPU", f"{self.cpu_pct:4.1f}%", self.cpu_pct),
+            ("Memory", f"{human_bytes(mem_used)} / {human_bytes(mem_total)}", mem_pct),
+            ("Disk", f"{human_bytes(d_used)} / {human_bytes(d_total)}", d_pct),
+            ("Network", f"↓{human_rate(self.rx_rate)}  ↑{human_rate(self.tx_rate)}", 0.0),
         ]
 
-        for i, (name, pct, val) in enumerate(tiles):
-            tx0 = x + 2 + i * colw
+        for i, (name, value, pct) in enumerate(tiles):
+            tx0 = x + 2 + i * tile_w
             if tx0 >= x + w - 2:
                 break
-            label = ellipsize(name, colw - 2)
-            stdscr.attron(curses.A_BOLD)
-            stdscr.addnstr(y + 2, tx0, label, colw - 1)
-            stdscr.attroff(curses.A_BOLD)
+            # title
+            stdscr.attron(curses.color_pair(5) | curses.A_BOLD)
+            stdscr.addnstr(y + 2, tx0, ellipsize(name, tile_w - 1), tile_w - 1)
+            stdscr.attroff(curses.color_pair(5) | curses.A_BOLD)
 
             if name != "Network":
-                bw = max(6, colw - 6)
-                stdscr.addnstr(y + 3, tx0, "[" + " " * bw + "]", colw - 1)
-                fill = int(round((pct / 100.0) * bw))
-                fill = clamp(fill, 0, bw)
-                stdscr.attron(curses.color_pair(4 if pct >= 85 else 3 if pct >= 60 else 2))
-                stdscr.addnstr(y + 3, tx0 + 1, "█" * fill, bw)
-                stdscr.attroff(curses.color_pair(4 if pct >= 85 else 3 if pct >= 60 else 2))
-                stdscr.addnstr(y + 4, tx0, val, colw - 1)
+                # bar
+                bw = max(8, tile_w - 4)
+                col = curses.color_pair(4 if pct >= 85 else 3 if pct >= 60 else 1)
+                stdscr.addnstr(y + 3, tx0, "[" + " " * bw + "]", tile_w - 1)
+                stdscr.attron(col)
+                stdscr.addnstr(y + 3, tx0 + 1, bar(bw, pct), bw)
+                stdscr.attroff(col)
+
+                # value + percent
+                stdscr.attron(curses.color_pair(2))
+                if name == "CPU":
+                    vv = f"{value}   Load {load1} {load5} {load15}"
+                else:
+                    vv = f"{value}   ({pct:4.1f}%)"
+                stdscr.addnstr(y + 4, tx0, ellipsize(vv, tile_w - 1), tile_w - 1)
+                stdscr.attroff(curses.color_pair(2))
             else:
-                stdscr.addnstr(y + 3, tx0, val, colw - 1)
-                stdscr.addnstr(y + 4, tx0, f"Load {load1} {load5} {load15}", colw - 1)
+                stdscr.attron(curses.color_pair(2))
+                stdscr.addnstr(y + 3, tx0, ellipsize(value, tile_w - 1), tile_w - 1)
+                stdscr.addnstr(y + 4, tx0, ellipsize(f"Load {load1} {load5} {load15}", tile_w - 1), tile_w - 1)
+                stdscr.attroff(curses.color_pair(2))
 
-    def draw_process_table(self, stdscr, y, x, h, w, procs):
-        draw_box(stdscr, y, x, h, w, title="Processes", color=curses.color_pair(2))
+    def draw_processes(self, stdscr, y, x, h, w, dt_last_refresh):
+        draw_box(stdscr, y, x, h, w, title="Processes", color=curses.color_pair(1))
 
-        # header
-        header_y = y + 2
         cols = [
-            ("Name", 0.46),
+            ("Name", 0.52),
             ("PID", 0.10),
             ("CPU", 0.10),
             ("Memory", 0.12),
             ("Disk", 0.10),
             ("User", 0.12),
         ]
-        # compute absolute widths
+
         inner_w = w - 4
         widths = [max(6, int(inner_w * frac)) for _, frac in cols]
-        # normalize to fit
         totalw = sum(widths)
         if totalw > inner_w:
-            widths[0] = max(6, widths[0] - (totalw - inner_w))
+            widths[0] = max(8, widths[0] - (totalw - inner_w))
 
-        # draw column titles
+        header_y = y + 2
         xx = x + 2
-        stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+        stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
         for (name, _), cw in zip(cols, widths):
             stdscr.addnstr(header_y, xx, ellipsize(name, cw), cw)
             xx += cw
-        stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+        stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
         stdscr.hline(header_y + 1, x + 1, curses.ACS_HLINE, w - 2)
 
-        # rows
         rows_y = header_y + 2
         rows_avail = max(1, (y + h - 2) - rows_y)
 
-        n = len(procs)
+        n = len(self.procs)
+
         # scroll
         if self.selected < self.scroll:
             self.scroll = self.selected
@@ -650,36 +622,41 @@ class TaskMan:
             self.scroll = self.selected - rows_avail + 1
         self.scroll = clamp(self.scroll, 0, max(0, n - rows_avail))
 
+        # determine visible pids for IO (cap to keep it cheap)
+        visible = self.procs[self.scroll : min(n, self.scroll + min(rows_avail, MAX_VISIBLE_IO))]
+        visible_pids = [p["pid"] for p in visible]
+        self.update_visible_io(visible_pids, dt_last_refresh)
+
         for i in range(rows_avail):
             idx = self.scroll + i
             if idx >= n:
                 break
-            p = procs[idx]
+            p = self.procs[idx]
             pid = p["pid"]
             user = p["user"]
             cpu = p["cpu"]
             mem_mb = p["mem_mb"]
-            io_bps = p["io_bps"]
+            cmd = p["cmd"]
 
-            name = p["cmd"]
+            io_bps = self.io_bps_cache.get(pid, 0.0)
+            io_txt = human_rate(io_bps) if io_bps > 0 else "-"
 
             row_y = rows_y + i
             selected = (idx == self.selected)
 
-            # row color
             if selected:
                 stdscr.attron(curses.color_pair(6) | curses.A_BOLD)
             else:
-                hot = 4 if cpu >= 40 else 3 if cpu >= 10 else 5
-                stdscr.attron(curses.color_pair(hot))
+                hot = curses.color_pair(4 if cpu >= 40 else 3 if cpu >= 10 else 5)
+                stdscr.attron(hot)
 
             xx = x + 2
             fields = [
-                ellipsize(name, widths[0] - 1),
+                ellipsize(cmd, widths[0] - 1),
                 str(pid),
                 f"{cpu:>4.1f}%",
                 f"{mem_mb:>6.1f}M",
-                human_rate(io_bps),
+                io_txt,
                 ellipsize(user, widths[5] - 1),
             ]
 
@@ -690,66 +667,41 @@ class TaskMan:
             if selected:
                 stdscr.attroff(curses.color_pair(6) | curses.A_BOLD)
             else:
-                stdscr.attroff(curses.color_pair(hot))
+                stdscr.attroff(hot)
 
-        # footer
-        footer = f"{n} processes   |   Sort: {self.sort_mode}   |   Filter: {self.filter_text or '-'}"
-        stdscr.attron(curses.color_pair(1))
+        footer = f"{n} processes  |  Sort:{self.sort_mode}  |  Filter:{self.filter_text or '-'}"
+        stdscr.attron(curses.color_pair(2))
         stdscr.addnstr(y + h - 2, x + 2, ellipsize(footer, w - 4), w - 4)
-        stdscr.attroff(curses.color_pair(1))
+        stdscr.attroff(curses.color_pair(2))
 
-    def draw_perf(self, stdscr, y, x, h, w, sysinfo):
-        draw_box(stdscr, y, x, h, w, title="Performance", color=curses.color_pair(2))
+    def draw_performance(self, stdscr, y, x, h, w):
+        draw_box(stdscr, y, x, h, w, title="Performance", color=curses.color_pair(1))
 
-        inner_w = w - 4
-        graph_w = max(10, inner_w - 14)
+        mem_used = self.sysinfo["mem_used"]
+        mem_total = self.sysinfo["mem_total"]
+        mem_pct = self.sysinfo["mem_pct"]
 
-        def line_graph(arr, vmax):
-            if not arr:
-                return ""
-            # compress to graph_w
-            if len(arr) <= graph_w:
-                vals = arr[:]
-            else:
-                step = len(arr) / float(graph_w)
-                vals = [arr[int(i * step)] for i in range(graph_w)]
-            return "".join(spark(v, vmax) for v in vals)
+        d_used = self.sysinfo["disk_used"]
+        d_total = self.sysinfo["disk_total"]
+        d_pct = self.sysinfo["disk_pct"]
 
-        cpu_g = line_graph(self.hist_cpu, 100.0)
-        mem_g = line_graph(self.hist_mem, 100.0)
-        dsk_g = line_graph(self.hist_dsk, 100.0)
+        load1, load5, load15 = self.sysinfo["load"]
 
-        # network graph uses max of recent to scale
-        rx_max = max(self.hist_rx) if self.hist_rx else 1.0
-        tx_max = max(self.hist_tx) if self.hist_tx else 1.0
-        rx_g = line_graph(self.hist_rx, rx_max)
-        tx_g = line_graph(self.hist_tx, tx_max)
-
-        rows = [
-            ("CPU", f"{pct_str(self.cpu_pct)}", cpu_g),
-            ("MEM", f"{pct_str(sysinfo['mem_pct'])}", mem_g),
-            ("DSK", f"{pct_str(sysinfo['disk_pct'])}", dsk_g),
-            ("NET↓", human_rate(sysinfo["rx_rate"]), rx_g),
-            ("NET↑", human_rate(sysinfo["tx_rate"]), tx_g),
+        lines = [
+            f"CPU:    {self.cpu_pct:4.1f}%    Load: {load1} {load5} {load15}",
+            f"Memory: {human_bytes(mem_used)} / {human_bytes(mem_total)}   ({mem_pct:4.1f}%)",
+            f"Disk:   {human_bytes(d_used)} / {human_bytes(d_total)}   ({d_pct:4.1f}%)",
+            f"Net:    ↓{human_rate(self.rx_rate)}   ↑{human_rate(self.tx_rate)}",
         ]
 
         yy = y + 2
-        for name, val, g in rows:
+        for ln in lines:
             if yy >= y + h - 2:
                 break
-            stdscr.attron(curses.A_BOLD)
-            stdscr.addnstr(yy, x + 2, f"{name:<4}", 4)
-            stdscr.attroff(curses.A_BOLD)
-            stdscr.addnstr(yy, x + 7, ellipsize(val, 12), 12)
-            stdscr.attron(curses.color_pair(2))
-            stdscr.addnstr(yy, x + 20, ellipsize(g, graph_w), graph_w)
-            stdscr.attroff(curses.color_pair(2))
+            stdscr.attron(curses.color_pair(5))
+            stdscr.addnstr(yy, x + 2, ellipsize(ln, w - 4), w - 4)
+            stdscr.attroff(curses.color_pair(5))
             yy += 2
-
-        more = f"Disk IO: ↓{human_rate(sysinfo['dsr'])} ↑{human_rate(sysinfo['dsw'])}   |   Main disk: {self.disk_name or '-'}"
-        stdscr.attron(curses.color_pair(1))
-        stdscr.addnstr(y + h - 2, x + 2, ellipsize(more, w - 4), w - 4)
-        stdscr.attroff(curses.color_pair(1))
 
     # -------------------- main loop --------------------
 
@@ -760,155 +712,164 @@ class TaskMan:
 
         curses.start_color()
         curses.use_default_colors()
-        # colors
-        curses.init_pair(1, curses.COLOR_CYAN, -1)        # info
-        curses.init_pair(2, curses.COLOR_GREEN, -1)       # good
-        curses.init_pair(3, curses.COLOR_YELLOW, -1)      # warn
-        curses.init_pair(4, curses.COLOR_RED, -1)         # hot
-        curses.init_pair(5, curses.COLOR_WHITE, -1)       # normal
-        curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_CYAN)  # selected row
 
-        # init deltas
+        # Colors (no "terminal green")
+        # 1 = cyan (frames), 2 = magenta (info), 3 = yellow (warn), 4 = red (hot), 5 = white, 6 = selected row
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        curses.init_pair(2, curses.COLOR_MAGENTA, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_RED, -1)
+        curses.init_pair(5, curses.COLOR_WHITE, -1)
+        curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_CYAN)
+
+        # init
         self.prev_cpu_total, self.prev_cpu_idle = read_cpu_total_idle()
         self.prev_rx, self.prev_tx = read_net_bytes_total()
-        self.prev_dsr, self.prev_dsw = read_disk_sectors(self.disk_name)
+        last_refresh = time.monotonic()
+        last_draw = 0.0
+        dt_last_refresh = REFRESH_SEC
 
-        last = time.time()
-        procs = []
+        # initial fetch
+        self.calc_system(REFRESH_SEC)
+        self.build_processes(REFRESH_SEC)
+
+        need_redraw = True
 
         while True:
-            now = time.time()
-            dt = max(0.2, now - last)
-            last = now
+            now = time.monotonic()
 
-            # update system
-            sysinfo = self.calc_system(dt)
+            # refresh tick (heavy work only here)
+            if now - last_refresh >= REFRESH_SEC:
+                dt = now - last_refresh
+                last_refresh = now
+                dt_last_refresh = max(0.2, dt)
 
-            # update processes only if needed (process tab)
-            if self.tab == TAB_PROCESSES:
-                procs = self.build_processes(dt)
+                self.calc_system(dt_last_refresh)
+                if self.tab == TAB_PROCESSES:
+                    self.build_processes(dt_last_refresh)
 
-            # layout
-            h, w = stdscr.getmaxyx()
-            stdscr.erase()
+                need_redraw = True
 
-            # top title bar
-            title = "Task Manager"
-            right = "Tab=switch   K=end task   S=sort   /=filter   Q=quit"
-            stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-            stdscr.addnstr(0, 2, title, w - 4)
-            stdscr.addnstr(0, max(2, w - len(right) - 2), right, w - 4)
-            stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
-
-            # toast line
-            if self.toast_msg and time.time() < self.toast_until:
-                stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
-                stdscr.addnstr(1, 2, ellipsize(self.toast_msg, w - 4), w - 4)
-                stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
-
-            # panes
-            sidebar_w = 18
-            sidebar_w = min(sidebar_w, max(14, w // 6))
-            main_x = sidebar_w + 1
-
-            # sidebar
-            self.draw_sidebar(stdscr, 2, 1, h - 3, sidebar_w)
-
-            # summary box
-            sum_h = 7
-            self.draw_top_summary(stdscr, 2, main_x, sum_h, w - main_x - 1, sysinfo)
-
-            # main content
-            content_y = 2 + sum_h
-            content_h = h - content_y - 1
-            content_w = w - main_x - 1
-
-            if self.tab == TAB_PROCESSES:
-                self.draw_process_table(stdscr, content_y, main_x, content_h, content_w, procs)
-            else:
-                self.draw_perf(stdscr, content_y, main_x, content_h, content_w, sysinfo)
-
-            stdscr.refresh()
-
-            # input
+            # read input (cheap)
             try:
                 ch = stdscr.getch()
             except Exception:
                 ch = -1
 
-            if ch == -1:
-                time.sleep(0.05)
-                continue
+            if ch != -1:
+                # quit
+                if ch in (ord("q"), ord("Q")):
+                    return
 
-            # quit
-            if ch in (ord("q"), ord("Q")):
-                return
+                # tab switch
+                if ch == 9:  # TAB
+                    self.tab = TAB_PERF if self.tab == TAB_PROCESSES else TAB_PROCESSES
+                    need_redraw = True
 
-            # switch tabs
-            if ch in (9,):  # TAB
-                self.tab = TAB_PERF if self.tab == TAB_PROCESSES else TAB_PROCESSES
-                self.toast("Switched tab")
-                continue
+                # filter
+                elif ch == ord("/"):
+                    s = self.dialog_filter(stdscr)
+                    if s is not None:
+                        self.filter_text = s
+                        self.selected = 0
+                        self.scroll = 0
+                        if self.tab == TAB_PROCESSES:
+                            # rebuild immediately after filter (still lightweight)
+                            self.build_processes(dt_last_refresh)
+                        need_redraw = True
 
-            # filter
-            if ch == ord("/"):
-                s = self.dialog_filter(stdscr)
-                if s is not None:
-                    self.filter_text = s
-                    self.selected = 0
-                    self.scroll = 0
-                    self.toast("Filter applied" if s else "Filter cleared")
-                continue
+                # sort
+                elif ch in (ord("s"), ord("S")):
+                    self.sort_mode = "MEM" if self.sort_mode == "CPU" else "CPU"
+                    if self.tab == TAB_PROCESSES:
+                        self.build_processes(dt_last_refresh)
+                    need_redraw = True
 
-            # sort
-            if ch in (ord("s"), ord("S")):
-                if self.sort_mode == "CPU":
-                    self.sort_mode = "MEM"
-                elif self.sort_mode == "MEM":
-                    self.sort_mode = "DISK"
+                # navigation (only processes tab)
+                elif self.tab == TAB_PROCESSES:
+                    n = len(self.procs)
+                    if ch in (curses.KEY_UP, ord("k")):
+                        if self.selected > 0:
+                            self.selected -= 1
+                            need_redraw = True
+                    elif ch in (curses.KEY_DOWN, ord("j")):
+                        if self.selected < max(0, n - 1):
+                            self.selected += 1
+                            need_redraw = True
+                    elif ch == curses.KEY_PPAGE:
+                        self.selected = max(0, self.selected - 12)
+                        need_redraw = True
+                    elif ch == curses.KEY_NPAGE:
+                        self.selected = min(max(0, n - 1), self.selected + 12)
+                        need_redraw = True
+                    elif ch == curses.KEY_HOME:
+                        self.selected = 0
+                        need_redraw = True
+                    elif ch == curses.KEY_END:
+                        self.selected = max(0, n - 1)
+                        need_redraw = True
+
+                    # end task (no PID typing)
+                    elif ch in (ord("K"),):  # capital K only to avoid conflict with arrow key helpers
+                        if self.procs:
+                            pid = self.procs[self.selected]["pid"]
+                            sig = self.dialog_kill(stdscr, pid)
+                            need_redraw = True
+                            if sig is not None:
+                                ok, err = self.kill_pid(pid, sig)
+                                self.toast(f"{'TERM' if sig == signal.SIGTERM else 'KILL'} sent to {pid}" if ok else f"Failed: {err}", 2.0)
+
+                # force redraw after any input
+                # (already set in branches)
+
+            # draw only when needed (or toast visible)
+            toast_visible = self.toast_msg and (now < self.toast_until)
+            if need_redraw or toast_visible:
+                h, w = stdscr.getmaxyx()
+                stdscr.erase()
+
+                # title bar
+                title = "Task Manager"
+                right = "Tab switch  |  K end task  |  S sort  |  / filter  |  Q quit"
+                stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+                stdscr.addnstr(0, 2, title, w - 4)
+                stdscr.addnstr(0, max(2, w - len(right) - 2), right, w - 4)
+                stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+                # toast line
+                if toast_visible:
+                    stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
+                    stdscr.addnstr(1, 2, ellipsize(self.toast_msg, w - 4), w - 4)
+                    stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
                 else:
-                    self.sort_mode = "CPU"
-                self.toast(f"Sort: {self.sort_mode}")
-                continue
+                    self.toast_msg = ""
 
-            # processes navigation / actions
-            if self.tab == TAB_PROCESSES:
-                n = len(procs)
+                # layout
+                sidebar_w = min(max(16, w // 6), 22)
+                main_x = sidebar_w + 1
+                top_y = 2
+                sum_h = 7
 
-                if ch in (curses.KEY_UP, ord("k")):
-                    if self.selected > 0:
-                        self.selected -= 1
-                elif ch in (curses.KEY_DOWN, ord("j")):
-                    if self.selected < max(0, n - 1):
-                        self.selected += 1
-                elif ch == curses.KEY_PPAGE:
-                    self.selected = max(0, self.selected - 12)
-                elif ch == curses.KEY_NPAGE:
-                    self.selected = min(max(0, n - 1), self.selected + 12)
-                elif ch == curses.KEY_HOME:
-                    self.selected = 0
-                elif ch == curses.KEY_END:
-                    self.selected = max(0, n - 1)
+                self.draw_sidebar(stdscr, top_y, 1, h - top_y - 1, sidebar_w)
+                self.draw_summary(stdscr, top_y, main_x, sum_h, w - main_x - 1)
 
-                # end task (no typing PID)
-                elif ch in (ord("k"), ord("K")):
-                    if not procs:
-                        self.toast("No process")
-                        continue
-                    pid = procs[self.selected]["pid"]
-                    sig = self.dialog_kill(stdscr, pid)
-                    if sig is None:
-                        self.toast("Cancelled")
-                        continue
-                    ok, err = self.kill_selected(pid, sig)
-                    if ok:
-                        self.toast(f"Sent {'TERM' if sig == signal.SIGTERM else 'KILL'} to {pid}")
-                    else:
-                        self.toast(f"Failed: {err}")
+                content_y = top_y + sum_h
+                content_h = h - content_y - 1
+                content_w = w - main_x - 1
+
+                if self.tab == TAB_PROCESSES:
+                    self.draw_processes(stdscr, content_y, main_x, content_h, content_w, dt_last_refresh)
+                else:
+                    self.draw_performance(stdscr, content_y, main_x, content_h, content_w)
+
+                stdscr.refresh()
+                need_redraw = False
+
+            # tiny sleep to keep CPU low
+            time.sleep(0.03)
 
 def main():
-    tm = TaskMan()
-    curses.wrapper(tm.run)
+    curses.wrapper(TaskMan().run)
 
 if __name__ == "__main__":
     main()
