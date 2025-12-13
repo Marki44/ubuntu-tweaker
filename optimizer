@@ -23,6 +23,41 @@ BASE_PACKAGES = [
     "openssl"
 ]
 
+# ---------- UI (clean modern menu) ----------
+RESET   = "\033[0m"
+BOLD    = "\033[1m"
+DIM     = "\033[2m"
+CYAN    = "\033[36m"
+GREEN   = "\033[32m"
+YELLOW  = "\033[33m"
+RED     = "\033[31m"
+MAGENTA = "\033[35m"
+
+def clear_screen():
+    # Works well in SSH too
+    print("\033[2J\033[H", end="")
+
+def pause_return():
+    input(f"\n{DIM}Press Enter to return to menu...{RESET}")
+
+def box_line(text: str, width: int) -> str:
+    # Keeps menu aligned even if text shorter
+    if len(text) > width - 4:
+        text = text[: width - 7] + "..."
+    return f"│ {text.ljust(width - 4)} │"
+
+def print_box(title: str, lines: list[str], width: int = 74):
+    top = "┌" + "─" * (width - 2) + "┐"
+    mid = "├" + "─" * (width - 2) + "┤"
+    bot = "└" + "─" * (width - 2) + "┘"
+    print(top)
+    print(box_line(f"{BOLD}{title}{RESET}", width))
+    print(mid)
+    for ln in lines:
+        print(box_line(ln, width))
+    print(bot)
+
+# ---------- core helpers ----------
 def is_root() -> bool:
     return os.geteuid() == 0
 
@@ -49,13 +84,9 @@ def run(cmd, check=True, env=None):
         merged_env.update(env)
     return subprocess.run(cmd, check=check, env=merged_env)
 
-def pause():
-    input("\nPress Enter to continue...")
-
 def header(title: str):
-    print("\n" + "=" * 70)
-    print(title)
-    print("=" * 70 + "\n")
+    print(f"\n{BOLD}{CYAN}{title}{RESET}")
+    print(f"{DIM}{'-' * 70}{RESET}\n")
 
 def detect_ubuntu():
     name = "unknown"
@@ -72,11 +103,9 @@ def detect_ubuntu():
         ver = kv.get("VERSION_ID", "unknown")
     except Exception:
         pass
-    log(f"OS: {name} {ver}")
     return name, ver
 
 # ----------------------- Actions -----------------------
-
 def action_update_upgrade_cleanup():
     header("Update + Upgrade + Full-Upgrade + Cleanup")
     run(["apt-get", "update"] + APT_OPTS)
@@ -211,20 +240,15 @@ def action_network_bbr():
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 
-# Buffers (reasonable for small VPS, not extreme)
 net.core.rmem_max=8388608
 net.core.wmem_max=8388608
 net.ipv4.tcp_rmem=4096 87380 8388608
 net.ipv4.tcp_wmem=4096 65536 8388608
 
-# Backlogs (moderate)
 net.core.somaxconn=1024
 net.ipv4.tcp_max_syn_backlog=2048
 
-# Wider ephemeral range (safe)
 net.ipv4.ip_local_port_range=10240 65535
-
-# Help with PMTU issues on tunnels (usually safe)
 net.ipv4.tcp_mtu_probing=1
 """
     os.makedirs("/etc/sysctl.d", exist_ok=True)
@@ -291,29 +315,29 @@ def action_report():
 
 def action_release_upgrade_manual():
     header("Ubuntu Release Upgrade (MANUAL / interactive only)")
-
     name, ver = detect_ubuntu()
+
     if "Ubuntu" not in name:
-        log("This release upgrade helper is for Ubuntu only. Skipping.")
+        log("This helper is for Ubuntu only. Skipping.")
         return
 
     if ver.startswith("20."):
-        target = "22.04 LTS (step 1 of 2 to reach 24.04)"
+        target = "22.04 LTS (then later 24.04)"
     elif ver.startswith("22."):
         target = "24.04 LTS"
     elif ver.startswith("24."):
-        log("You are already on Ubuntu 24.x. No upgrade target available here.")
+        log("You are already on Ubuntu 24.x. No upgrade target available.")
         return
     else:
         log(f"Unsupported Ubuntu version detected: {ver}")
         return
 
-    log(f"Detected Ubuntu {ver}. Upgrade target: {target}")
-    print("This uses Ubuntu's official upgrader (do-release-upgrade).")
-    print("It is interactive and MUST be supervised.")
-    print("Recommended: take a snapshot/backup and run inside tmux/screen.\n")
+    print(f"{YELLOW}Detected:{RESET} Ubuntu {ver}")
+    print(f"{YELLOW}Target:{RESET}   {target}\n")
+    print(f"{DIM}This runs Ubuntu's official upgrader (do-release-upgrade) and MUST be supervised.{RESET}")
+    print(f"{DIM}Recommended: snapshot/backup and run inside tmux/screen.{RESET}\n")
 
-    ans = input(f"Proceed to start the interactive upgrade toward {target}? (type YES): ").strip()
+    ans = input("Type YES to start the interactive upgrade: ").strip()
     if ans != "YES":
         log("Cancelled release upgrade.")
         return
@@ -321,7 +345,7 @@ def action_release_upgrade_manual():
     run(["apt-get", "update"] + APT_OPTS)
     run(["apt-get", "install"] + APT_OPTS + ["update-manager-core"])
 
-    # Ensure Prompt=lts (safer for servers)
+    # Ensure Prompt=lts
     rug = "/etc/update-manager/release-upgrades"
     try:
         if os.path.exists(rug):
@@ -344,16 +368,14 @@ def action_release_upgrade_manual():
     except Exception as e:
         log(f"Could not adjust {rug}: {e}")
 
-    log("Pre-upgrade: making sure system is fully updated first...")
+    log("Pre-upgrade: fully updating first...")
     action_update_upgrade_cleanup()
 
     run(["do-release-upgrade", "-c"], check=False)
-
-    log("Starting do-release-upgrade (interactive). Follow the prompts on screen...")
-    # Note: interactive by nature; we still try non-interactive view, but prompts can appear.
+    log("Starting do-release-upgrade (interactive). Follow prompts on screen...")
     run(["do-release-upgrade"], check=False)
 
-    log("Release upgrade command finished. A reboot may be required.")
+    log("Release upgrade finished. Reboot may be required.")
 
 def action_run_all():
     header("RUN ALL (safe baseline + optional extras)")
@@ -374,31 +396,46 @@ def action_run_all():
 
     action_update_upgrade_cleanup()
     action_report()
-
-    log("Done: RUN ALL completed. (Ubuntu release upgrade is always manual: option 11)")
+    log("Done: RUN ALL completed. (Release upgrade stays manual: option 11)")
 
 # ----------------------- Menu -----------------------
-
 def menu():
-    detect_ubuntu()
     while True:
-        print("\n" + "-" * 70)
-        print("Ubuntu Optimizer Menu (SAFE) - Ubuntu 20/22/24")
-        print("Log:", LOG_FILE)
-        print("-" * 70)
-        print("1) Update + full-upgrade + cleanup")
-        print("2) Install baseline tools (curl/jq/htop/ncdu...)")
-        print("3) Enable unattended security updates")
-        print("4) Limit journald disk usage (prevent log bloat)")
-        print("5) Enable fstrim.timer (SSD maintenance)")
-        print("6) Apply safe sysctl hardening")
-        print("7) Network optimization + enable BBR (safe defaults)")
-        print("8) RAM expand (create swapfile) [opt-in]")
-        print("9) Report (boot time, disk, RAM, slow services)")
-        print("10) RUN ALL (safe baseline + optional prompts)")
-        print("11) Ubuntu release upgrade (MANUAL / interactive only)")
-        print("0) Exit")
-        choice = input("\nChoose: ").strip()
+        clear_screen()
+        name, ver = detect_ubuntu()
+
+        title = f"{GREEN}Ubuntu Tweaker{RESET}  {DIM}(safe menu • Ubuntu 20/22/24){RESET}"
+        meta = f"{DIM}OS:{RESET} {name} {ver}   {DIM}Log:{RESET} {LOG_FILE}"
+
+        lines = [
+            meta,
+            "",
+            f"{CYAN}  1){RESET} Update + full-upgrade + cleanup",
+            f"{CYAN}  2){RESET} Install baseline tools (curl/jq/htop/ncdu...)",
+            f"{CYAN}  3){RESET} Enable unattended security updates",
+            f"{CYAN}  4){RESET} Limit journald disk usage (prevent log bloat)",
+            f"{CYAN}  5){RESET} Enable fstrim.timer (SSD maintenance)",
+            f"{CYAN}  6){RESET} Apply safe sysctl hardening",
+            f"{CYAN}  7){RESET} Network optimization + enable BBR (safe defaults)",
+            f"{CYAN}  8){RESET} RAM expand (create swapfile)  {DIM}[opt-in]{RESET}",
+            f"{CYAN}  9){RESET} Report (boot time, disk, RAM, slow services)",
+            f"{CYAN} 10){RESET} RUN ALL (safe baseline + optional prompts)",
+            f"{YELLOW} 11){RESET} Ubuntu release upgrade  {DIM}(manual / interactive only){RESET}",
+            "",
+            f"{MAGENTA}  0){RESET} Exit",
+        ]
+
+        print_box(title, lines, width=80)
+
+        choice = input(f"\n{BOLD}Select:{RESET} ").strip().lower()
+
+        if choice in ("0", "q", "quit", "exit"):
+            clear_screen()
+            log("Exit.")
+            return
+
+        # Clean screen before running actions (no menu spam)
+        clear_screen()
 
         try:
             if choice == "1": action_update_upgrade_cleanup()
@@ -412,17 +449,14 @@ def menu():
             elif choice == "9": action_report()
             elif choice == "10": action_run_all()
             elif choice == "11": action_release_upgrade_manual()
-            elif choice == "0":
-                log("Exit.")
-                break
             else:
-                print("Invalid choice.")
+                print(f"{RED}Invalid choice.{RESET}")
         except subprocess.CalledProcessError as e:
             log(f"Command failed: {e}")
         except Exception as e:
             log(f"Error: {e}")
 
-        pause()
+        pause_return()
 
 def main():
     if not is_root():
