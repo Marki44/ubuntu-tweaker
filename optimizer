@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import os
 import sys
+import time
+import signal
 import subprocess
 import shutil
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 LOG_FILE = "/var/log/server-baseline-menu.log"
 
@@ -64,8 +66,7 @@ def print_menu_header(os_name: str, os_ver: str):
     print(title.center(term_width()))
     sub = f"{DIM}{os_name} {os_ver}{RESET}"
     print(sub.center(term_width()))
-    print(f"{GREEN}{hr()}{RESET}")
-    print(f"{DIM}Log:{RESET} {WHITE}{LOG_FILE}{RESET}\n")
+    print(f"{GREEN}{hr()}{RESET}\n")
 
 def menu_item(key: str, label: str, hint: str = "") -> str:
     k = f"{CYAN}{key:<2}{RESET}"
@@ -88,7 +89,7 @@ def log(msg: str) -> None:
     except Exception:
         pass
 
-def run(cmd, check=True, env=None):
+def run(cmd, check=True, env=None, capture=False, text=True):
     if isinstance(cmd, str):
         display = cmd
     else:
@@ -98,7 +99,13 @@ def run(cmd, check=True, env=None):
     merged_env["DEBIAN_FRONTEND"] = "noninteractive"
     if env:
         merged_env.update(env)
-    return subprocess.run(cmd, check=check, env=merged_env)
+    return subprocess.run(
+        cmd,
+        check=check,
+        env=merged_env,
+        capture_output=capture,
+        text=text
+    )
 
 def header(title: str):
     print(f"\n{BOLD}{CYAN}{title}{RESET}")
@@ -121,7 +128,176 @@ def detect_ubuntu():
         pass
     return name, ver
 
-# ----------------------- Actions -----------------------
+def cmd_out(cmd: List[str]) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        return (r.stdout or "").strip()
+    except Exception:
+        return ""
+
+def which(bin_name: str) -> bool:
+    return shutil.which(bin_name) is not None
+
+# ---------------- Task Monitor helpers ----------------
+def get_default_iface() -> Optional[str]:
+    # Try default route interface
+    out = cmd_out(["bash", "-lc", "ip route | awk '/default/ {print $5; exit}'"])
+    out = out.strip()
+    return out if out else None
+
+def get_cpu_line_from_top() -> str:
+    # Example: "%Cpu(s):  1.0 us,  0.5 sy,  0.0 ni, 98.2 id, ..."
+    out = cmd_out(["bash", "-lc", "top -bn1 | sed -n '3p'"])
+    return out
+
+def get_mem_line_from_free() -> str:
+    # Example: "Mem:  987Mi  123Mi  456Mi ..."
+    out = cmd_out(["bash", "-lc", "free -h | awk 'NR==2{print \"Mem: used=\" $3 \"/\" $2 \", free=\" $4 \", avail=\" $7}'"])
+    return out
+
+def get_disk_line() -> str:
+    out = cmd_out(["bash", "-lc", "df -hT / | awk 'NR==2{print \"Disk(/): used=\" $4 \"/\" $3 \", avail=\" $5 \", fs=\" $2}'"])
+    return out
+
+def get_uptime_line() -> str:
+    out = cmd_out(["bash", "-lc", "uptime -p 2>/dev/null || uptime"])
+    out2 = cmd_out(["bash", "-lc", "cat /proc/loadavg | awk '{print \"load:\" $1 \",\" $2 \",\" $3}'"])
+    if out2:
+        return f"{out}  |  {out2}"
+    return out
+
+def get_net_line(iface: Optional[str]) -> str:
+    if not iface:
+        return "Net: (no default interface found)"
+    # RX/TX bytes from ip -s link
+    # We compute human-ish in bash
+    script = r"""
+iface="$1"
+rx=$(cat /sys/class/net/"$iface"/statistics/rx_bytes 2>/dev/null || echo 0)
+tx=$(cat /sys/class/net/"$iface"/statistics/tx_bytes 2>/dev/null || echo 0)
+
+h() {
+  b=$1
+  if [ "$b" -lt 1024 ]; then echo "${b}B"; return; fi
+  kb=$((b/1024))
+  if [ "$kb" -lt 1024 ]; then echo "${kb}KiB"; return; fi
+  mb=$((kb/1024))
+  if [ "$mb" -lt 1024 ]; then echo "${mb}MiB"; return; fi
+  gb=$((mb/1024))
+  echo "${gb}GiB"
+}
+
+echo "Net($iface): RX=$(h "$rx")  TX=$(h "$tx")"
+"""
+    out = cmd_out(["bash", "-lc", script, "bash", iface])
+    return out if out else f"Net({iface}): (stats unavailable)"
+
+def get_top_processes(sort_by: str = "cpu", limit: int = 12) -> str:
+    # sort_by: "cpu" or "mem"
+    if sort_by == "mem":
+        cmd = "ps -eo pid,user,pmem,pcpu,etime,comm --sort=-pmem | head -n {}".format(limit)
+    else:
+        cmd = "ps -eo pid,user,pcpu,pmem,etime,comm --sort=-pcpu | head -n {}".format(limit)
+    out = cmd_out(["bash", "-lc", cmd])
+    return out
+
+def show_process(pid: int) -> str:
+    out = cmd_out(["bash", "-lc", f"ps -p {pid} -o pid,user,pcpu,pmem,etime,cmd --no-headers"])
+    return out
+
+def kill_process(pid: int, force: bool = False) -> bool:
+    try:
+        os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+        return True
+    except Exception:
+        return False
+
+def action_task_monitor():
+    iface = get_default_iface()
+    sort_mode = "cpu"  # cpu or mem
+
+    while True:
+        clear_screen()
+        print(f"{GREEN}{hr()}{RESET}")
+        print(f"{BOLD}{GREEN}Task Monitor{RESET}".center(term_width()))
+        sub = f"{DIM}Refresh: R  |  Sort: S  |  Kill: K  |  htop/top: H  |  Back: Q{RESET}"
+        print(sub.center(term_width()))
+        print(f"{GREEN}{hr()}{RESET}\n")
+
+        # Summary
+        uptime_line = get_uptime_line()
+        cpu_line = get_cpu_line_from_top()
+        mem_line = get_mem_line_from_free()
+        disk_line = get_disk_line()
+        net_line = get_net_line(iface)
+
+        print(f"{WHITE}{uptime_line}{RESET}")
+        if cpu_line:
+            print(f"{WHITE}{cpu_line}{RESET}")
+        print(f"{WHITE}{mem_line}{RESET}")
+        print(f"{WHITE}{disk_line}{RESET}")
+        print(f"{WHITE}{net_line}{RESET}")
+        print(f"\n{DIM}{hr('─')}{RESET}\n")
+
+        # Processes
+        title = "Top processes (CPU)" if sort_mode == "cpu" else "Top processes (MEM)"
+        print(f"{BOLD}{WHITE}{title}{RESET}  {DIM}(PID USER %CPU %MEM TIME CMD){RESET}\n")
+        print(get_top_processes(sort_by=sort_mode, limit=14))
+        print(f"\n{DIM}{hr('─')}{RESET}")
+
+        choice = input(f"{BOLD}Command{RESET} {DIM}(R/S/K/H/Q){RESET}: ").strip().lower()
+
+        if choice in ("q", "quit", "back", "0"):
+            return
+
+        if choice in ("r", ""):
+            continue
+
+        if choice == "s":
+            sort_mode = "mem" if sort_mode == "cpu" else "cpu"
+            continue
+
+        if choice == "h":
+            # Open htop if available, else top
+            clear_screen()
+            if which("htop"):
+                subprocess.run(["htop"])
+            else:
+                subprocess.run(["top"])
+            continue
+
+        if choice == "k":
+            pid_str = input("PID to terminate (or blank to cancel): ").strip()
+            if not pid_str:
+                continue
+            if not pid_str.isdigit():
+                print(f"{RED}Invalid PID.{RESET}")
+                time.sleep(1.2)
+                continue
+            pid = int(pid_str)
+
+            info = show_process(pid)
+            if not info:
+                print(f"{RED}PID not found (or permission denied).{RESET}")
+                time.sleep(1.3)
+                continue
+
+            print(f"\n{YELLOW}Target:{RESET} {info}")
+            print(f"{DIM}This can break services. Use TERM first; KILL only if needed.{RESET}\n")
+
+            confirm = input("Type TERM to send SIGTERM, KILL for SIGKILL, or cancel: ").strip().upper()
+            if confirm == "TERM":
+                ok = kill_process(pid, force=False)
+                print(f"{GREEN}SIGTERM sent.{RESET}" if ok else f"{RED}Failed to send SIGTERM.{RESET}")
+                time.sleep(1.2)
+            elif confirm == "KILL":
+                ok = kill_process(pid, force=True)
+                print(f"{GREEN}SIGKILL sent.{RESET}" if ok else f"{RED}Failed to send SIGKILL.{RESET}")
+                time.sleep(1.2)
+            else:
+                continue
+
+# ----------------------- Baseline actions -----------------------
 def action_update_upgrade_cleanup():
     header("Update + Upgrade + Full-Upgrade + Cleanup")
     run(["apt-get", "update"] + APT_OPTS)
@@ -324,7 +500,6 @@ def action_report():
 
     log("Slow boot units:")
     run(["bash", "-lc", "systemd-analyze blame | head -n 15"], check=False)
-    log(f"Log file: {LOG_FILE}")
 
 def action_release_upgrade_manual():
     header("Ubuntu Release Upgrade (Manual)")
@@ -334,7 +509,6 @@ def action_release_upgrade_manual():
         log("Ubuntu only. Skipping.")
         return
 
-    # Build options based on current version
     if ver.startswith("20."):
         print(f"{YELLOW}Detected:{RESET} Ubuntu {ver}\n")
         print(f"{WHITE}Choose upgrade target:{RESET}")
@@ -348,6 +522,9 @@ def action_release_upgrade_manual():
         if choice == "2":
             print(f"\n{RED}Not supported as a normal direct upgrade from 20.04 → 24.04.{RESET}")
             print(f"{DIM}Do 20.04 → 22.04 first, then run the upgrade again for 24.04.{RESET}")
+            return
+        if choice != "1":
+            print(f"{RED}Invalid choice.{RESET}")
             return
         target = "22.04 LTS"
     elif ver.startswith("22."):
@@ -372,7 +549,7 @@ def action_release_upgrade_manual():
         return
 
     print(f"\n{YELLOW}Target:{RESET} {target}")
-    print(f"{DIM}This is interactive and must be supervised (tmux/screen + snapshot recommended).{RESET}\n")
+    print(f"{DIM}Interactive + must be supervised (tmux/screen + snapshot recommended).{RESET}\n")
 
     ans = input("Type YES to start: ").strip()
     if ans != "YES":
@@ -390,7 +567,7 @@ def action_release_upgrade_manual():
 
 def action_run_all():
     header("Run Everything")
-    # NOTE: This does NOT include release upgrade. Upgrade stays manual.
+    # NOTE: does NOT include release upgrade (manual only)
     action_update_upgrade_cleanup()
     action_install_base_tools()
     action_unattended_upgrades()
@@ -418,20 +595,21 @@ def menu():
 
         print(f"{BOLD}{WHITE}Main{RESET}")
         print(menu_item("1", "Run everything", "does not include release upgrade"))
+        print(menu_item("2", "Task monitor", "CPU/RAM/Disk/Net + kill by PID"))
         print()
 
         print(f"{BOLD}{WHITE}Maintenance{RESET}")
-        print(menu_item("2", "Update + upgrade + cleanup"))
-        print(menu_item("3", "Install baseline tools"))
-        print(menu_item("4", "Enable automatic security updates"))
-        print(menu_item("5", "Limit system logs (journald)"))
-        print(menu_item("6", "Enable SSD trim (fstrim)"))
+        print(menu_item("3", "Update + upgrade + cleanup"))
+        print(menu_item("4", "Install baseline tools"))
+        print(menu_item("5", "Enable automatic security updates"))
+        print(menu_item("6", "Limit system logs (journald)"))
+        print(menu_item("7", "Enable SSD trim (fstrim)"))
         print()
 
         print(f"{BOLD}{WHITE}Tuning{RESET}")
-        print(menu_item("7", "Sysctl hardening"))
-        print(menu_item("8", "Enable BBR network tuning"))
-        print(menu_item("9", "Create swap (RAM expand)"))
+        print(menu_item("8", "Sysctl hardening"))
+        print(menu_item("9", "Enable BBR network tuning"))
+        print(menu_item("10", "Create swap (RAM expand)"))
         print()
 
         print(f"{BOLD}{WHITE}Tools{RESET}")
@@ -440,7 +618,7 @@ def menu():
         print()
 
         print(f"{DIM}{hr('─')}{RESET}")
-        choice = input(f"{BOLD}Select{RESET} {DIM}(1-9, R, U, Q){RESET}: ").strip().lower()
+        choice = input(f"{BOLD}Select{RESET} {DIM}(1-10, R, U, Q){RESET}: ").strip().lower()
 
         if choice in ("q", "quit", "0", "exit"):
             clear_screen()
@@ -450,14 +628,15 @@ def menu():
         clear_screen()
         try:
             if choice == "1": action_run_all()
-            elif choice == "2": action_update_upgrade_cleanup()
-            elif choice == "3": action_install_base_tools()
-            elif choice == "4": action_unattended_upgrades()
-            elif choice == "5": action_journald_limits()
-            elif choice == "6": action_enable_fstrim()
-            elif choice == "7": action_sysctl_hardening()
-            elif choice == "8": action_network_bbr()
-            elif choice == "9": action_create_swap()
+            elif choice == "2": action_task_monitor()
+            elif choice == "3": action_update_upgrade_cleanup()
+            elif choice == "4": action_install_base_tools()
+            elif choice == "5": action_unattended_upgrades()
+            elif choice == "6": action_journald_limits()
+            elif choice == "7": action_enable_fstrim()
+            elif choice == "8": action_sysctl_hardening()
+            elif choice == "9": action_network_bbr()
+            elif choice == "10": action_create_swap()
             elif choice == "r": action_report()
             elif choice == "u": action_release_upgrade_manual()
             else:
