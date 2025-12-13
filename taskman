@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+# taskman - built-in terminal task manager (no external apps)
+# Ubuntu 20/22/24 | Python 3.8+ | Uses /proc only
+
+import os
+import time
+import curses
+import shutil
+import signal
+
+HZ = os.sysconf(os.sysconf_names.get("SC_CLK_TCK", "SC_CLK_TCK"))
+PAGE = os.sysconf("SC_PAGE_SIZE")
+
+def read_text(path, default=""):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except Exception:
+        return default
+
+def read_first_line(path, default=""):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.readline().strip()
+    except Exception:
+        return default
+
+def clamp(n, lo, hi):
+    return lo if n < lo else hi if n > hi else n
+
+def human_bytes(n):
+    try:
+        n = float(n)
+    except Exception:
+        return "0B"
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    u = 0
+    while n >= 1024 and u < len(units) - 1:
+        n /= 1024.0
+        u += 1
+    if u == 0:
+        return f"{int(n)}{units[u]}"
+    return f"{n:.1f}{units[u]}"
+
+def bar(width, pct):
+    # width includes the bar content only
+    pct = clamp(pct, 0.0, 100.0)
+    filled = int(round((pct / 100.0) * width))
+    filled = clamp(filled, 0, width)
+    return "█" * filled + " " * (width - filled)
+
+def get_uptime_seconds():
+    s = read_first_line("/proc/uptime", "0 0")
+    try:
+        return float(s.split()[0])
+    except Exception:
+        return 0.0
+
+def get_loadavg():
+    s = read_first_line("/proc/loadavg", "0 0 0 0/0 0")
+    parts = s.split()
+    return parts[0:3] if len(parts) >= 3 else ["0", "0", "0"]
+
+def read_cpu_total_and_idle():
+    # /proc/stat: cpu  user nice system idle iowait irq softirq steal ...
+    line = read_first_line("/proc/stat", "")
+    if not line.startswith("cpu "):
+        return 0, 0
+    parts = line.split()
+    vals = [int(x) for x in parts[1:]]
+    total = sum(vals)
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+    return total, idle
+
+def read_meminfo():
+    # returns dict kB
+    out = {}
+    for line in read_text("/proc/meminfo").splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        v = v.strip().split()
+        if not v:
+            continue
+        try:
+            out[k] = int(v[0])
+        except Exception:
+            continue
+    return out
+
+def disk_usage_root():
+    try:
+        du = shutil.disk_usage("/")
+        return du.total, du.used, du.free
+    except Exception:
+        return 0, 0, 0
+
+def read_net_bytes():
+    # /proc/net/dev totals for all interfaces except lo
+    rx = 0
+    tx = 0
+    for line in read_text("/proc/net/dev").splitlines():
+        if ":" not in line:
+            continue
+        iface, rest = line.split(":", 1)
+        iface = iface.strip()
+        if iface == "lo":
+            continue
+        cols = rest.split()
+        if len(cols) < 16:
+            continue
+        try:
+            rx += int(cols[0])
+            tx += int(cols[8])
+        except Exception:
+            pass
+    return rx, tx
+
+def list_pids():
+    pids = []
+    for name in os.listdir("/proc"):
+        if name.isdigit():
+            pids.append(int(name))
+    return pids
+
+def read_proc_stat(pid):
+    # returns (utime_ticks, stime_ticks)
+    # /proc/[pid]/stat has tricky comm in parentheses
+    s = read_text(f"/proc/{pid}/stat", "")
+    if not s:
+        return None
+    # find last ')'
+    r = s.rfind(")")
+    if r == -1:
+        return None
+    after = s[r+2:].split()  # skip ") "
+    # fields after comm: state ppid ... utime(14) stime(15) in original indexing
+    # In 'after' list, utime is index 11, stime index 12
+    if len(after) < 13:
+        return None
+    try:
+        ut = int(after[11])
+        st = int(after[12])
+        return ut, st
+    except Exception:
+        return None
+
+def read_proc_rss_kb(pid):
+    # /proc/[pid]/status VmRSS
+    for line in read_text(f"/proc/{pid}/status").splitlines():
+        if line.startswith("VmRSS:"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    return int(parts[1])  # kB
+                except Exception:
+                    return 0
+    return 0
+
+def read_proc_user(pid):
+    # parse uid from /proc/[pid]/status then map in /etc/passwd
+    uid = None
+    for line in read_text(f"/proc/{pid}/status").splitlines():
+        if line.startswith("Uid:"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    uid = int(parts[1])
+                except Exception:
+                    uid = None
+            break
+    if uid is None:
+        return "?"
+    # quick passwd lookup cache
+    return uid_to_user(uid)
+
+_UID_CACHE = {}
+_PASSWD_LOADED = False
+_UID_TO_NAME = {}
+
+def load_passwd():
+    global _PASSWD_LOADED, _UID_TO_NAME
+    if _PASSWD_LOADED:
+        return
+    _PASSWD_LOADED = True
+    txt = read_text("/etc/passwd")
+    for line in txt.splitlines():
+        if ":" not in line:
+            continue
+        parts = line.split(":")
+        if len(parts) < 3:
+            continue
+        name = parts[0]
+        try:
+            uid = int(parts[2])
+        except Exception:
+            continue
+        _UID_TO_NAME[uid] = name
+
+def uid_to_user(uid):
+    if uid in _UID_CACHE:
+        return _UID_CACHE[uid]
+    load_passwd()
+    name = _UID_TO_NAME.get(uid, str(uid))
+    _UID_CACHE[uid] = name
+    return name
+
+def read_proc_cmd(pid):
+    cmdline = read_text(f"/proc/{pid}/cmdline")
+    if cmdline:
+        # cmdline is NUL-separated
+        s = cmdline.replace("\x00", " ").strip()
+        if s:
+            return s[:120]
+    comm = read_first_line(f"/proc/{pid}/comm", "")
+    return comm[:120] if comm else str(pid)
+
+class TaskMan:
+    def __init__(self):
+        self.sort_mode = "CPU"  # CPU or MEM
+        self.filter_text = ""
+        self.selected = 0
+        self.scroll = 0
+
+        # CPU tracking
+        self.prev_cpu_total = 0
+        self.prev_cpu_idle = 0
+
+        # per-proc cpu tracking: pid -> prev_ticks
+        self.prev_proc_ticks = {}
+        self.prev_sample_total = 0
+
+        # net rates
+        self.prev_rx = 0
+        self.prev_tx = 0
+        self.prev_t = time.time()
+
+        self.message = ""
+        self.message_t = 0
+
+    def toast(self, msg, secs=2.0):
+        self.message = msg
+        self.message_t = time.time() + secs
+
+    def kill_pid(self, pid, sig):
+        try:
+            os.kill(pid, sig)
+            return True, ""
+        except PermissionError:
+            return False, "Permission denied"
+        except ProcessLookupError:
+            return False, "No such process"
+        except Exception as e:
+            return False, str(e)
+
+    def build_process_list(self, dt):
+        pids = list_pids()
+        procs = []
+        cpu_total, cpu_idle = read_cpu_total_and_idle()
+        total_delta = max(1, cpu_total - self.prev_cpu_total)  # ticks across all cores
+        self.prev_cpu_total = cpu_total
+        self.prev_cpu_idle = cpu_idle
+
+        # For per-proc CPU%, we compare proc tick deltas against total tick delta.
+        for pid in pids:
+            st = read_proc_stat(pid)
+            if not st:
+                continue
+            ut, stt = st
+            ticks = ut + stt
+            prev = self.prev_proc_ticks.get(pid, ticks)
+            self.prev_proc_ticks[pid] = ticks
+            proc_delta = max(0, ticks - prev)
+            cpu_pct = (proc_delta / total_delta) * 100.0
+
+            rss_kb = read_proc_rss_kb(pid)
+            mem_mb = rss_kb / 1024.0
+            user = read_proc_user(pid)
+            cmd = read_proc_cmd(pid)
+
+            # filter
+            if self.filter_text:
+                f = self.filter_text.lower()
+                if f not in cmd.lower() and f not in user.lower() and f not in str(pid):
+                    continue
+
+            procs.append({
+                "pid": pid,
+                "user": user,
+                "cpu": cpu_pct,
+                "mem": mem_mb,
+                "cmd": cmd,
+            })
+
+        if self.sort_mode == "MEM":
+            procs.sort(key=lambda x: (x["mem"], x["cpu"]), reverse=True)
+        else:
+            procs.sort(key=lambda x: (x["cpu"], x["mem"]), reverse=True)
+
+        # keep selection stable
+        if self.selected >= len(procs):
+            self.selected = max(0, len(procs) - 1)
+        return procs
+
+    def draw(self, stdscr):
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.keypad(True)
+
+        # colors
+        curses.start_color()
+        curses.use_default_colors()
+        # pair ids
+        curses.init_pair(1, curses.COLOR_CYAN, -1)    # titles
+        curses.init_pair(2, curses.COLOR_GREEN, -1)   # good
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)  # warn
+        curses.init_pair(4, curses.COLOR_RED, -1)     # hot
+        curses.init_pair(5, curses.COLOR_WHITE, -1)   # normal
+        curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_CYAN)  # selected row
+
+        # init baselines
+        self.prev_cpu_total, self.prev_cpu_idle = read_cpu_total_and_idle()
+        self.prev_rx, self.prev_tx = read_net_bytes()
+        self.prev_t = time.time()
+
+        last_refresh = 0
+        procs = []
+
+        while True:
+            now = time.time()
+            h, w = stdscr.getmaxyx()
+            stdscr.erase()
+
+            # refresh every 1s
+            if now - last_refresh >= 1.0:
+                dt = max(0.1, now - last_refresh) if last_refresh else 1.0
+                procs = self.build_process_list(dt)
+                last_refresh = now
+
+            # stats
+            cpu_total, cpu_idle = read_cpu_total_and_idle()
+            # compute cpu usage over a tiny window using prev fields (already updated in build_process_list),
+            # so use /proc/stat now against stored prev to show smooth:
+            # We'll estimate using the last total_delta; simplest: show loadavg + process list CPU% is enough.
+            load1, load5, load15 = get_loadavg()
+            mem = read_meminfo()
+            mem_total_kb = mem.get("MemTotal", 0)
+            mem_avail_kb = mem.get("MemAvailable", 0)
+            mem_used_kb = max(0, mem_total_kb - mem_avail_kb)
+            mem_pct = (mem_used_kb / mem_total_kb * 100.0) if mem_total_kb else 0.0
+
+            d_total, d_used, d_free = disk_usage_root()
+            d_pct = (d_used / d_total * 100.0) if d_total else 0.0
+
+            rx, tx = read_net_bytes()
+            dt_net = max(0.1, now - self.prev_t)
+            rx_rate = (rx - self.prev_rx) / dt_net
+            tx_rate = (tx - self.prev_tx) / dt_net
+            self.prev_rx, self.prev_tx, self.prev_t = rx, tx, now
+
+            # top header
+            title = "Task Manager"
+            subtitle = f"Sort:{self.sort_mode}  Filter:{self.filter_text or '-'}"
+            keyhelp = "Keys: ↑↓ PgUp/PgDn  C=CPU  M=MEM  /=Filter  K=Kill  R=Refresh  Q=Back"
+            stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+            stdscr.addnstr(0, 0, title, w-1)
+            stdscr.addnstr(0, max(0, w - len(keyhelp) - 1), keyhelp, w-1)
+            stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+            stdscr.attron(curses.color_pair(5))
+            stdscr.addnstr(1, 0, subtitle, w-1)
+            stdscr.attroff(curses.color_pair(5))
+
+            # bars row
+            bar_w = max(10, (w - 10) // 3)
+            y = 3
+            # MEM
+            mem_line = f"MEM {mem_pct:5.1f}% {human_bytes(mem_used_kb*1024)}/{human_bytes(mem_total_kb*1024)}"
+            stdscr.attron(curses.color_pair(5) | curses.A_BOLD)
+            stdscr.addnstr(y, 0, mem_line, w-1)
+            stdscr.attroff(curses.color_pair(5) | curses.A_BOLD)
+            stdscr.addnstr(y+1, 0, "[" + bar(bar_w, mem_pct) + "]", w-1)
+
+            # DISK
+            disk_line = f"DISK {d_pct:5.1f}% {human_bytes(d_used)}/{human_bytes(d_total)}"
+            x2 = max(0, w//3)
+            stdscr.attron(curses.color_pair(5) | curses.A_BOLD)
+            stdscr.addnstr(y, x2, disk_line, w-1-x2)
+            stdscr.attroff(curses.color_pair(5) | curses.A_BOLD)
+            stdscr.addnstr(y+1, x2, "[" + bar(bar_w, d_pct) + "]", w-1-x2)
+
+            # NET
+            net_line = f"NET ↓{human_bytes(rx_rate)}/s ↑{human_bytes(tx_rate)}/s"
+            x3 = max(0, (w//3)*2)
+            stdscr.attron(curses.color_pair(5) | curses.A_BOLD)
+            stdscr.addnstr(y, x3, net_line, w-1-x3)
+            stdscr.attroff(curses.color_pair(5) | curses.A_BOLD)
+            stdscr.addnstr(y+1, x3, f"Load {load1} {load5} {load15}", w-1-x3)
+
+            # table header
+            table_y = y + 3
+            stdscr.hline(table_y, 0, ord("─"), w-1)
+            table_y += 1
+
+            header_line = f"{'PID':>7}  {'USER':<10}  {'CPU%':>6}  {'MEM':>7}  COMMAND"
+            stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+            stdscr.addnstr(table_y, 0, header_line, w-1)
+            stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+            table_y += 1
+            stdscr.hline(table_y, 0, ord("─"), w-1)
+            table_y += 1
+
+            # compute visible rows
+            rows_avail = max(3, h - table_y - 2)
+            n = len(procs)
+
+            # scroll logic
+            if self.selected < self.scroll:
+                self.scroll = self.selected
+            if self.selected >= self.scroll + rows_avail:
+                self.scroll = self.selected - rows_avail + 1
+            self.scroll = clamp(self.scroll, 0, max(0, n - rows_avail))
+
+            # draw rows
+            for i in range(rows_avail):
+                idx = self.scroll + i
+                if idx >= n:
+                    break
+                p = procs[idx]
+                pid = p["pid"]
+                user = p["user"][:10]
+                cpu = p["cpu"]
+                memmb = p["mem"]
+                cmd = p["cmd"]
+
+                row = f"{pid:7d}  {user:<10}  {cpu:6.1f}  {memmb:6.1f}M  {cmd}"
+                if idx == self.selected:
+                    stdscr.attron(curses.color_pair(6) | curses.A_BOLD)
+                    stdscr.addnstr(table_y + i, 0, row, w-1)
+                    stdscr.attroff(curses.color_pair(6) | curses.A_BOLD)
+                else:
+                    # color CPU hotness
+                    if cpu >= 40:
+                        col = 4
+                    elif cpu >= 10:
+                        col = 3
+                    else:
+                        col = 5
+                    stdscr.attron(curses.color_pair(col))
+                    stdscr.addnstr(table_y + i, 0, row, w-1)
+                    stdscr.attroff(curses.color_pair(col))
+
+            # footer
+            stdscr.hline(h-2, 0, ord("─"), w-1)
+            footer = f"{n} processes  |  Selected: {procs[self.selected]['pid'] if procs else '-'}"
+            stdscr.attron(curses.color_pair(5))
+            stdscr.addnstr(h-1, 0, footer, w-1)
+            stdscr.attroff(curses.color_pair(5))
+
+            # toast message
+            if self.message and time.time() < self.message_t:
+                msg = self.message
+                stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+                stdscr.addnstr(2, 0, msg, w-1)
+                stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+            else:
+                self.message = ""
+
+            stdscr.refresh()
+
+            # input
+            try:
+                ch = stdscr.getch()
+            except Exception:
+                ch = -1
+
+            if ch == -1:
+                time.sleep(0.03)
+                continue
+
+            if ch in (ord("q"), ord("Q")):
+                return
+
+            if ch in (curses.KEY_UP, ord("k")):
+                if self.selected > 0:
+                    self.selected -= 1
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                if self.selected < max(0, n - 1):
+                    self.selected += 1
+            elif ch == curses.KEY_PPAGE:  # PageUp
+                self.selected = max(0, self.selected - rows_avail)
+            elif ch == curses.KEY_NPAGE:  # PageDown
+                self.selected = min(max(0, n - 1), self.selected + rows_avail)
+
+            elif ch in (ord("c"), ord("C")):
+                self.sort_mode = "CPU"
+                self.toast("Sorting by CPU")
+            elif ch in (ord("m"), ord("M")):
+                self.sort_mode = "MEM"
+                self.toast("Sorting by MEM")
+            elif ch in (ord("r"), ord("R")):
+                last_refresh = 0
+                self.toast("Refreshed")
+
+            elif ch == ord("/"):
+                # filter prompt
+                curses.curs_set(1)
+                stdscr.nodelay(False)
+                stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+                stdscr.addnstr(2, 0, "Filter (empty clears): ", w-1)
+                stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+                stdscr.clrtoeol()
+                stdscr.refresh()
+                curses.echo()
+                try:
+                    s = stdscr.getstr(2, min(w-1, 22), 60)
+                    s = s.decode("utf-8", errors="ignore").strip()
+                except Exception:
+                    s = ""
+                curses.noecho()
+                stdscr.nodelay(True)
+                curses.curs_set(0)
+                self.filter_text = s
+                self.selected = 0
+                self.scroll = 0
+                self.toast("Filter applied" if s else "Filter cleared")
+
+            elif ch in (ord("K"), ord("k")) and ch == ord("K"):
+                # Kill prompt (TERM/KILL)
+                if not procs:
+                    self.toast("No process selected")
+                    continue
+                pid = procs[self.selected]["pid"]
+                curses.curs_set(1)
+                stdscr.nodelay(False)
+                stdscr.addnstr(2, 0, f"Kill PID {pid}: type TERM or KILL (or blank cancel): ", w-1)
+                stdscr.clrtoeol()
+                stdscr.refresh()
+                curses.echo()
+                try:
+                    s = stdscr.getstr(2, 0, 80)
+                    s = s.decode("utf-8", errors="ignore").strip().upper()
+                except Exception:
+                    s = ""
+                curses.noecho()
+                stdscr.nodelay(True)
+                curses.curs_set(0)
+
+                if not s:
+                    self.toast("Cancelled")
+                    continue
+                if s not in ("TERM", "KILL"):
+                    self.toast("Invalid (use TERM or KILL)")
+                    continue
+                sig = signal.SIGTERM if s == "TERM" else signal.SIGKILL
+                ok, err = self.kill_pid(pid, sig)
+                if ok:
+                    self.toast(f"Sent {s} to {pid}")
+                else:
+                    self.toast(f"Failed: {err}")
+
+def main():
+    if os.geteuid() != 0:
+        # non-root is fine; you just might not be able to kill some processes
+        pass
+    tm = TaskMan()
+    curses.wrapper(tm.draw)
+
+if __name__ == "__main__":
+    main()
