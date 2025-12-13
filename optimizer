@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+from datetime import datetime
+
+LOG_FILE = "/var/log/server-baseline-menu.log"
+
+APT_OPTS = [
+    "-y",
+    "-o", "Dpkg::Options::=--force-confdef",
+    "-o", "Dpkg::Options::=--force-confold",
+]
+
+BASE_PACKAGES = [
+    "ca-certificates", "curl", "gnupg", "lsb-release", "apt-transport-https",
+    "software-properties-common",
+    "unattended-upgrades", "needrestart",
+    "nano", "vim-tiny",
+    "htop", "iotop", "iftop", "ncdu",
+    "jq",
+    "logrotate",
+    "openssl"
+]
+
+def is_root() -> bool:
+    return os.geteuid() == 0
+
+def log(msg: str) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line)
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+def run(cmd, check=True, env=None):
+    if isinstance(cmd, str):
+        display = cmd
+    else:
+        display = " ".join(cmd)
+    log(f"RUN: {display}")
+    merged_env = os.environ.copy()
+    merged_env["DEBIAN_FRONTEND"] = "noninteractive"
+    if env:
+        merged_env.update(env)
+    return subprocess.run(cmd, check=check, env=merged_env)
+
+def pause():
+    input("\nPress Enter to continue...")
+
+def header(title: str):
+    print("\n" + "=" * 70)
+    print(title)
+    print("=" * 70 + "\n")
+
+def detect_ubuntu():
+    name = "unknown"
+    ver = "unknown"
+    try:
+        with open("/etc/os-release", "r", encoding="utf-8") as f:
+            data = f.read().splitlines()
+        kv = {}
+        for line in data:
+            if "=" in line:
+                k, v = line.split("=", 1)
+                kv[k.strip()] = v.strip().strip('"')
+        name = kv.get("NAME", "unknown")
+        ver = kv.get("VERSION_ID", "unknown")
+    except Exception:
+        pass
+    log(f"OS: {name} {ver}")
+    return name, ver
+
+# ----------------------- Actions -----------------------
+
+def action_update_upgrade_cleanup():
+    header("Update + Upgrade + Full-Upgrade + Cleanup")
+    run(["apt-get", "update"] + APT_OPTS)
+    run(["apt-get", "upgrade"] + APT_OPTS)
+    run(["apt-get", "full-upgrade"] + APT_OPTS)
+    run(["apt-get", "autoremove", "--purge"] + APT_OPTS)
+    run(["apt-get", "autoclean"] + APT_OPTS)
+    log("Done: update/upgrade/full-upgrade/autoremove/autoclean")
+
+def action_install_base_tools():
+    header("Install Baseline Tools (safe)")
+    run(["apt-get", "update"] + APT_OPTS)
+    run(["apt-get", "install", "--no-install-recommends"] + APT_OPTS + BASE_PACKAGES)
+    log("Done: installed baseline packages")
+
+def action_unattended_upgrades():
+    header("Enable Unattended Security Updates (safe)")
+    run(["apt-get", "update"] + APT_OPTS)
+    run(["apt-get", "install"] + APT_OPTS + ["unattended-upgrades"])
+
+    auto_up = """APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::AutocleanInterval "7";
+APT::Periodic::Unattended-Upgrade "1";
+"""
+    os.makedirs("/etc/apt/apt.conf.d", exist_ok=True)
+    with open("/etc/apt/apt.conf.d/20auto-upgrades", "w", encoding="utf-8") as f:
+        f.write(auto_up)
+
+    f50 = "/etc/apt/apt.conf.d/50unattended-upgrades"
+    if os.path.exists(f50):
+        with open(f50, "r", encoding="utf-8") as f:
+            content = f.read()
+        if 'Remove-Unused-Dependencies' not in content:
+            content += '\nUnattended-Upgrade::Remove-Unused-Dependencies "true";\n'
+        if 'Automatic-Reboot' not in content:
+            content += '\nUnattended-Upgrade::Automatic-Reboot "false";\n'
+        if 'Automatic-Reboot-Time' not in content:
+            content += '\nUnattended-Upgrade::Automatic-Reboot-Time "03:30";\n'
+        with open(f50, "w", encoding="utf-8") as f:
+            f.write(content)
+    else:
+        with open(f50, "w", encoding="utf-8") as f:
+            f.write(
+                'Unattended-Upgrade::Remove-Unused-Dependencies "true";\n'
+                'Unattended-Upgrade::Automatic-Reboot "false";\n'
+                'Unattended-Upgrade::Automatic-Reboot-Time "03:30";\n'
+            )
+
+    run(["systemctl", "enable", "--now", "unattended-upgrades"], check=False)
+    log("Done: unattended upgrades enabled (no auto-reboot)")
+
+def action_journald_limits():
+    header("Limit Journald Disk Usage (safe)")
+    os.makedirs("/etc/systemd/journald.conf.d", exist_ok=True)
+    cfg = """[Journal]
+SystemMaxUse=200M
+RuntimeMaxUse=100M
+MaxRetentionSec=14day
+Compress=yes
+"""
+    with open("/etc/systemd/journald.conf.d/99-baseline.conf", "w", encoding="utf-8") as f:
+        f.write(cfg)
+
+    run(["systemctl", "restart", "systemd-journald"], check=False)
+    run(["journalctl", "--vacuum-time=14d"], check=False)
+    run(["journalctl", "--vacuum-size=200M"], check=False)
+    log("Done: journald limited + vacuum applied")
+
+def action_enable_fstrim():
+    header("Enable fstrim.timer (safe)")
+    res = subprocess.run(["systemctl", "list-unit-files"], capture_output=True, text=True)
+    if "fstrim.timer" in (res.stdout or ""):
+        run(["systemctl", "enable", "--now", "fstrim.timer"], check=False)
+        log("Done: fstrim.timer enabled")
+    else:
+        log("Skip: fstrim.timer not available on this system")
+
+def action_sysctl_hardening():
+    header("Apply Safe sysctl Hardening (conservative)")
+    cfg = """# Conservative hardening defaults (widely safe)
+
+net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.default.rp_filter=1
+
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv6.conf.all.accept_redirects=0
+net.ipv6.conf.default.accept_redirects=0
+
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+
+net.ipv4.tcp_syncookies=1
+
+net.ipv4.conf.all.accept_source_route=0
+net.ipv4.conf.default.accept_source_route=0
+net.ipv6.conf.all.accept_source_route=0
+net.ipv6.conf.default.accept_source_route=0
+
+net.ipv4.conf.all.log_martians=1
+net.ipv4.conf.default.log_martians=1
+
+kernel.kptr_restrict=2
+kernel.dmesg_restrict=1
+"""
+    os.makedirs("/etc/sysctl.d", exist_ok=True)
+    with open("/etc/sysctl.d/99-baseline-hardening.conf", "w", encoding="utf-8") as f:
+        f.write(cfg)
+
+    run(["sysctl", "--system"], check=False)
+    log("Done: sysctl hardening applied")
+
+def kernel_supports_bbr() -> bool:
+    try:
+        out = subprocess.check_output(
+            ["sysctl", "-n", "net.ipv4.tcp_available_congestion_control"],
+            text=True
+        ).strip()
+        return "bbr" in out.split()
+    except Exception:
+        return False
+
+def action_network_bbr():
+    header("Network Optimization + Enable BBR (safe defaults)")
+    if not kernel_supports_bbr():
+        log("BBR not available in this kernel. Skipping BBR enable.")
+        log("Tip: Ubuntu 20/22/24 usually supports it, but some VPS kernels differ.")
+        return
+
+    cfg = """# Safe network tuning: BBR + fq pacing + sane buffers (Ubuntu 20-24)
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+
+# Buffers (reasonable for small VPS, not extreme)
+net.core.rmem_max=8388608
+net.core.wmem_max=8388608
+net.ipv4.tcp_rmem=4096 87380 8388608
+net.ipv4.tcp_wmem=4096 65536 8388608
+
+# Backlogs (moderate)
+net.core.somaxconn=1024
+net.ipv4.tcp_max_syn_backlog=2048
+
+# Wider ephemeral range (safe)
+net.ipv4.ip_local_port_range=10240 65535
+
+# Help with PMTU issues on tunnels (usually safe)
+net.ipv4.tcp_mtu_probing=1
+"""
+    os.makedirs("/etc/sysctl.d", exist_ok=True)
+    with open("/etc/sysctl.d/99-baseline-bbr.conf", "w", encoding="utf-8") as f:
+        f.write(cfg)
+
+    run(["sysctl", "--system"], check=False)
+    log("Done: BBR enabled + safe network tuning applied")
+
+def action_create_swap():
+    header("RAM Expand (Swapfile) - Safe Opt-in")
+    show = subprocess.run(["swapon", "--show"], capture_output=True, text=True)
+    if (show.stdout or "").strip():
+        log("Swap already active. Skipping.")
+        return
+
+    size_gb = input("Swap size in GB (recommended 2 for small VPS, 0 to cancel): ").strip()
+    if not size_gb.isdigit():
+        log("Invalid input. Cancelled.")
+        return
+    size_gb_int = int(size_gb)
+    if size_gb_int <= 0:
+        log("Cancelled swap creation.")
+        return
+
+    swapfile = "/swapfile"
+    log(f"Creating {size_gb_int}G swapfile at {swapfile} ...")
+
+    try:
+        run(["fallocate", "-l", f"{size_gb_int}G", swapfile], check=True)
+    except Exception:
+        run(["dd", "if=/dev/zero", f"of={swapfile}", "bs=1M", f"count={size_gb_int*1024}"], check=True)
+
+    run(["chmod", "600", swapfile], check=True)
+    run(["mkswap", swapfile], check=True)
+    run(["swapon", swapfile], check=True)
+
+    with open("/etc/fstab", "r", encoding="utf-8") as f:
+        fstab = f.read()
+    if "/swapfile" not in fstab:
+        with open("/etc/fstab", "a", encoding="utf-8") as f:
+            f.write("\n/swapfile none swap sw 0 0\n")
+
+    log("Done: swap enabled and persisted in /etc/fstab")
+
+def action_report():
+    header("Server Report (boot, disk, memory, slow services)")
+    cmds = [
+        ["uname", "-a"],
+        ["df", "-hT", "/"],
+        ["free", "-h"],
+        ["uptime"],
+        ["systemd-analyze", "time"],
+    ]
+    for c in cmds:
+        run(c, check=False)
+        print()
+
+    log("Top 15 slow boot units:")
+    run(["bash", "-lc", "systemd-analyze blame | head -n 15"], check=False)
+
+    print()
+    log(f"Log file: {LOG_FILE}")
+
+def action_release_upgrade_manual():
+    header("Ubuntu Release Upgrade (MANUAL / interactive only)")
+
+    name, ver = detect_ubuntu()
+    if "Ubuntu" not in name:
+        log("This release upgrade helper is for Ubuntu only. Skipping.")
+        return
+
+    if ver.startswith("20."):
+        target = "22.04 LTS (step 1 of 2 to reach 24.04)"
+    elif ver.startswith("22."):
+        target = "24.04 LTS"
+    elif ver.startswith("24."):
+        log("You are already on Ubuntu 24.x. No upgrade target available here.")
+        return
+    else:
+        log(f"Unsupported Ubuntu version detected: {ver}")
+        return
+
+    log(f"Detected Ubuntu {ver}. Upgrade target: {target}")
+    print("This uses Ubuntu's official upgrader (do-release-upgrade).")
+    print("It is interactive and MUST be supervised.")
+    print("Recommended: take a snapshot/backup and run inside tmux/screen.\n")
+
+    ans = input(f"Proceed to start the interactive upgrade toward {target}? (type YES): ").strip()
+    if ans != "YES":
+        log("Cancelled release upgrade.")
+        return
+
+    run(["apt-get", "update"] + APT_OPTS)
+    run(["apt-get", "install"] + APT_OPTS + ["update-manager-core"])
+
+    # Ensure Prompt=lts (safer for servers)
+    rug = "/etc/update-manager/release-upgrades"
+    try:
+        if os.path.exists(rug):
+            with open(rug, "r", encoding="utf-8") as f:
+                content = f.read()
+        else:
+            content = ""
+        if "Prompt=" not in content:
+            content += "\nPrompt=lts\n"
+        else:
+            lines = []
+            for line in content.splitlines(True):
+                if line.strip().startswith("Prompt="):
+                    lines.append("Prompt=lts\n")
+                else:
+                    lines.append(line)
+            content = "".join(lines)
+        with open(rug, "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception as e:
+        log(f"Could not adjust {rug}: {e}")
+
+    log("Pre-upgrade: making sure system is fully updated first...")
+    action_update_upgrade_cleanup()
+
+    run(["do-release-upgrade", "-c"], check=False)
+
+    log("Starting do-release-upgrade (interactive). Follow the prompts on screen...")
+    # Note: interactive by nature; we still try non-interactive view, but prompts can appear.
+    run(["do-release-upgrade"], check=False)
+
+    log("Release upgrade command finished. A reboot may be required.")
+
+def action_run_all():
+    header("RUN ALL (safe baseline + optional extras)")
+    action_update_upgrade_cleanup()
+    action_install_base_tools()
+    action_unattended_upgrades()
+    action_enable_fstrim()
+    action_journald_limits()
+    action_sysctl_hardening()
+
+    ans = input("Enable BBR + safe network tuning? (y/N): ").strip().lower()
+    if ans == "y":
+        action_network_bbr()
+
+    ans = input("Create swap (RAM expand)? (y/N): ").strip().lower()
+    if ans == "y":
+        action_create_swap()
+
+    action_update_upgrade_cleanup()
+    action_report()
+
+    log("Done: RUN ALL completed. (Ubuntu release upgrade is always manual: option 11)")
+
+# ----------------------- Menu -----------------------
+
+def menu():
+    detect_ubuntu()
+    while True:
+        print("\n" + "-" * 70)
+        print("Ubuntu Optimizer Menu (SAFE) - Ubuntu 20/22/24")
+        print("Log:", LOG_FILE)
+        print("-" * 70)
+        print("1) Update + full-upgrade + cleanup")
+        print("2) Install baseline tools (curl/jq/htop/ncdu...)")
+        print("3) Enable unattended security updates")
+        print("4) Limit journald disk usage (prevent log bloat)")
+        print("5) Enable fstrim.timer (SSD maintenance)")
+        print("6) Apply safe sysctl hardening")
+        print("7) Network optimization + enable BBR (safe defaults)")
+        print("8) RAM expand (create swapfile) [opt-in]")
+        print("9) Report (boot time, disk, RAM, slow services)")
+        print("10) RUN ALL (safe baseline + optional prompts)")
+        print("11) Ubuntu release upgrade (MANUAL / interactive only)")
+        print("0) Exit")
+        choice = input("\nChoose: ").strip()
+
+        try:
+            if choice == "1": action_update_upgrade_cleanup()
+            elif choice == "2": action_install_base_tools()
+            elif choice == "3": action_unattended_upgrades()
+            elif choice == "4": action_journald_limits()
+            elif choice == "5": action_enable_fstrim()
+            elif choice == "6": action_sysctl_hardening()
+            elif choice == "7": action_network_bbr()
+            elif choice == "8": action_create_swap()
+            elif choice == "9": action_report()
+            elif choice == "10": action_run_all()
+            elif choice == "11": action_release_upgrade_manual()
+            elif choice == "0":
+                log("Exit.")
+                break
+            else:
+                print("Invalid choice.")
+        except subprocess.CalledProcessError as e:
+            log(f"Command failed: {e}")
+        except Exception as e:
+            log(f"Error: {e}")
+
+        pause()
+
+def main():
+    if not is_root():
+        print("Run as root (sudo). Example:\n  sudo ./optimizer")
+        sys.exit(1)
+    menu()
+
+if __name__ == "__main__":
+    main()
