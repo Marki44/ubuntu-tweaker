@@ -20,8 +20,14 @@ import signal
 
 REFRESH_SEC = 1.0
 JUMP_ROWS = 10
-PROCS_PANEL_ROWS = 12          # keeps process section vertically smaller
-MAX_PROCS_SCAN = 5000          # safety cap
+PROCS_PANEL_ROWS = 12
+MAX_PROCS_SCAN = 7000
+
+# Stability: keep process order stable unless a process "really" moves.
+STABLE_MODE = True
+STABLE_EVERY_N_TICKS = 3  # re-sort only every N refresh ticks
+CPU_SORT_EPS = 0.25       # % threshold to reduce jitter
+MEM_SORT_EPS_MB = 8       # MB threshold to reduce jitter
 
 # -------------------- helpers --------------------
 
@@ -52,7 +58,6 @@ def ellipsize(s, w):
     return s[:w - 1] + "…"
 
 def human_bytes_dec(n):
-    # decimal units: KB/MB/GB (not KiB/MiB/GiB)
     try:
         n = float(n)
     except Exception:
@@ -72,10 +77,11 @@ def human_rate_dec(nps):
     return f"{human_bytes_dec(nps)}/s"
 
 def meter(width, pct):
+    # draw a full "track" so you can see where the bar ends
     pct = clamp(pct, 0.0, 100.0)
     fill = int(round((pct / 100.0) * width))
     fill = clamp(fill, 0, width)
-    return "█" * fill + " " * (width - fill)
+    return ("█" * fill) + ("·" * (width - fill))
 
 def get_hostname():
     try:
@@ -93,8 +99,7 @@ def get_os_pretty():
     data = read_text("/etc/os-release", "")
     for line in data.splitlines():
         if line.startswith("PRETTY_NAME="):
-            v = line.split("=", 1)[1].strip().strip('"')
-            return v
+            return line.split("=", 1)[1].strip().strip('"')
     for line in data.splitlines():
         if line.startswith("NAME="):
             return line.split("=", 1)[1].strip().strip('"')
@@ -102,12 +107,12 @@ def get_os_pretty():
 
 def get_cpu_model():
     txt = read_text("/proc/cpuinfo", "")
-    for key in ("model name", "Model", "Hardware", "Processor"):
-        for line in txt.splitlines():
-            if ":" in line:
-                k, v = line.split(":", 1)
-                if k.strip().lower() == key.lower():
-                    return v.strip()
+    for line in txt.splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        if k.strip().lower() == "model name":
+            return v.strip()
     return "CPU"
 
 def get_uptime_str():
@@ -137,8 +142,7 @@ def safe_addnstr(stdscr, y, x, s, n, attr=0):
         h, w = stdscr.getmaxyx()
         if y < 0 or y >= h or x < 0 or x >= w:
             return
-        # avoid last cell; some PTYs ERR
-        maxn = max(0, min(n, w - x - 1))
+        maxn = max(0, min(n, w - x - 1))  # avoid last cell
         if maxn <= 0:
             return
         if attr:
@@ -169,7 +173,6 @@ def safe_hline(stdscr, y, x, ch, n, attr=0):
         return
 
 def draw_box(stdscr, y, x, h, w, title, attr_border, attr_title):
-    # clean, minimal box
     if h < 3 or w < 6:
         return
     safe_addnstr(stdscr, y, x, "┌" + "─" * (w - 2) + "┐", w, attr_border)
@@ -178,7 +181,6 @@ def draw_box(stdscr, y, x, h, w, title, attr_border, attr_title):
         safe_addnstr(stdscr, yy, x, "│", 1, attr_border)
         safe_addnstr(stdscr, yy, x + w - 1, "│", 1, attr_border)
         safe_fill(stdscr, yy, x + 1, w - 2, curses.color_pair(1))
-
     if title:
         t = f" {title} "
         safe_addnstr(stdscr, y, x + 2, ellipsize(t, w - 4), w - 4, attr_title)
@@ -321,7 +323,7 @@ def read_proc_cmd(pid):
     comm = read_first_line(f"/proc/{pid}/comm", "")
     return comm if comm else str(pid)
 
-# -------------------- TaskMan UI --------------------
+# -------------------- TaskMan --------------------
 
 class TaskMan:
     def __init__(self):
@@ -348,29 +350,30 @@ class TaskMan:
         self.sys = {}
         self.procs = []
 
-        # header info (static-ish)
         self.host = get_hostname()
         self.os_name = get_os_pretty()
         self.kernel = get_kernel()
         self.cpu_model = get_cpu_model()
         self.cores = os.cpu_count() or 1
 
+        self.tick = 0
+        self.stable_order = []      # list of pids in last displayed order
+        self.last_metrics = {}      # pid -> (cpu, mem)
+
     def init_colors(self, stdscr):
         curses.start_color()
-
-        # IMPORTANT: we do NOT call use_default_colors()
-        # so background is explicit BLACK, not terminal theme.
+        # do NOT use_default_colors — force real BLACK bg
         curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLACK)  # base
         curses.init_pair(2, curses.COLOR_CYAN, curses.COLOR_BLACK)   # headers
         curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK) # accents
         curses.init_pair(4, curses.COLOR_RED, curses.COLOR_BLACK)    # hot
-        curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_WHITE)  # selected row (invert)
+        curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_WHITE)  # selected invert
         curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLACK)  # subtle
 
         stdscr.bkgd(" ", curses.color_pair(1))
         stdscr.erase()
 
-    def toast(self, msg, secs=1.8):
+    def toast(self, msg, secs=1.6):
         self.toast_msg = msg
         self.toast_until = time.monotonic() + secs
 
@@ -399,7 +402,7 @@ class TaskMan:
         d_pct = (d_used / d_total * 100.0) if d_total else 0.0
 
         rx, tx = read_net_bytes_total()
-        dt2 = max(0.50, dt)
+        dt2 = max(0.75, dt)  # slower rate calc => calmer numbers
         if self.prev_rx:
             self.rx_rate = max(0.0, (rx - self.prev_rx) / dt2)
         if self.prev_tx:
@@ -425,6 +428,8 @@ class TaskMan:
         }
 
     def refresh_processes(self):
+        self.tick += 1
+
         pids = list_pids()
         cpu_total, _ = read_cpu_total_idle()
         total_delta = max(1, cpu_total - self.prev_cpu_total_for_procs) if self.prev_cpu_total_for_procs else 1
@@ -456,14 +461,42 @@ class TaskMan:
 
             out.append({"pid": pid, "user": user, "cpu": cpu_pct, "mem": mem_bytes, "cmd": cmd})
 
-        if self.sort_mode == "MEM":
-            out.sort(key=lambda x: (x["mem"], x["cpu"]), reverse=True)
+        # --- STABLE sorting to stop the list jumping while you scroll ---
+        if STABLE_MODE and self.stable_order and (self.tick % STABLE_EVERY_N_TICKS != 0):
+            # keep old order as much as possible; only inject new pids at the end
+            idx_map = {pid: i for i, pid in enumerate(self.stable_order)}
+            def key_stable(p):
+                return idx_map.get(p["pid"], 10**9)
+            out.sort(key=key_stable)
         else:
-            out.sort(key=lambda x: (x["cpu"], x["mem"]), reverse=True)
+            # normal sort, but with jitter dampening
+            if self.sort_mode == "MEM":
+                out.sort(key=lambda x: (x["mem"], x["cpu"]), reverse=True)
+            else:
+                out.sort(key=lambda x: (x["cpu"], x["mem"]), reverse=True)
+
+        # jitter dampening: if cpu/mem changes tiny, keep pid order around old order
+        if STABLE_MODE and self.stable_order and (self.tick % STABLE_EVERY_N_TICKS == 0):
+            # build new "stable_order" by grouping nearly-equal neighbors
+            # (simple approach: keep previous order within epsilon buckets)
+            old_pos = {pid: i for i, pid in enumerate(self.stable_order)}
+            def damp_key(p):
+                cpu = p["cpu"]
+                mem_mb = p["mem"] / 1e6
+                cpu_bucket = int(cpu / max(0.01, CPU_SORT_EPS))
+                mem_bucket = int(mem_mb / max(1, MEM_SORT_EPS_MB))
+                if self.sort_mode == "MEM":
+                    primary = (-mem_bucket, -cpu_bucket)
+                else:
+                    primary = (-cpu_bucket, -mem_bucket)
+                return (primary, old_pos.get(p["pid"], 10**9))
+            out.sort(key=damp_key)
+
+        self.stable_order = [p["pid"] for p in out]
+        self.last_metrics = {p["pid"]: (p["cpu"], p["mem"]) for p in out}
 
         if self.selected >= len(out):
             self.selected = max(0, len(out) - 1)
-
         self.procs = out
 
     def kill_pid(self, pid, sig):
@@ -476,8 +509,6 @@ class TaskMan:
             return False, "no such process"
         except Exception as e:
             return False, str(e)
-
-    # -------------------- dialogs --------------------
 
     def dialog_filter(self, stdscr):
         h, w = stdscr.getmaxyx()
@@ -517,22 +548,23 @@ class TaskMan:
     # -------------------- drawing --------------------
 
     def draw_header(self, stdscr, w):
-        # Line 0: name + status
         load1, load5, load15 = self.sys["load"]
         up = self.sys["uptime"]
-        right = f"cpu {self.sys['cpu_pct']:.1f}%  •  load {load1} {load5} {load15}  •  up {up}"
+
+        # Line 0: "Host — Task manager" and right status
+        left = f"{self.host} — Task Manager"
+        right = f"CPU {self.sys['cpu_pct']:.1f}% | Load {load1} {load5} {load15} | Uptime {up}"
         safe_fill(stdscr, 0, 0, w, curses.color_pair(1))
-        safe_addnstr(stdscr, 0, 2, "taskman", w - 4, curses.color_pair(2) | curses.A_BOLD)
+        safe_addnstr(stdscr, 0, 2, ellipsize(left, w // 2), w // 2, curses.color_pair(2) | curses.A_BOLD)
         safe_addnstr(stdscr, 0, max(2, w - len(right) - 2), right, len(right), curses.color_pair(2))
 
-        # Line 1: machine info
-        info = f"{self.host}  •  {self.os_name}  •  kernel {self.kernel}"
-        cpu = f"{self.cpu_model}  •  {self.cores} cores"
-        line = ellipsize(info + "  •  " + cpu, w - 4)
+        # Line 1: system info split so cores never disappear
+        left2 = f"{self.os_name} | Kernel {self.kernel}"
+        right2 = f"{self.cpu_model} | Cores {self.cores}"
         safe_fill(stdscr, 1, 0, w, curses.color_pair(1))
-        safe_addnstr(stdscr, 1, 2, line, w - 4, curses.color_pair(6))
+        safe_addnstr(stdscr, 1, 2, ellipsize(left2, w - 4), w - 4, curses.color_pair(6))
+        safe_addnstr(stdscr, 1, max(2, w - len(right2) - 2), right2, len(right2), curses.color_pair(6))
 
-        # toast (optional)
         if self.toast_msg and time.monotonic() < self.toast_until:
             safe_fill(stdscr, 2, 0, w, curses.color_pair(1))
             safe_addnstr(stdscr, 2, 2, ellipsize(self.toast_msg, w - 4), w - 4, curses.color_pair(3))
@@ -541,14 +573,11 @@ class TaskMan:
             safe_fill(stdscr, 2, 0, w, curses.color_pair(1))
 
     def draw_performance(self, stdscr, y, x, h, w):
-        # THIS is the “performance part” — make it clean + wide.
         draw_box(stdscr, y, x, h, w, "PERFORMANCE", curses.color_pair(2), curses.color_pair(2) | curses.A_BOLD)
 
-        # inner area
         ix, iy = x + 2, y + 2
         iw = w - 4
 
-        # metrics
         cpu_pct = self.sys["cpu_pct"]
         mem_used = self.sys["mem_used"]
         mem_total = self.sys["mem_total"]
@@ -559,37 +588,30 @@ class TaskMan:
         rx = self.sys["rx_rate"]
         tx = self.sys["tx_rate"]
 
-        # layout: 3 rows for CPU/MEM/DSK + 1 row NET
-        bar_w = max(18, min(40, iw // 2))
-        # CPU
-        cpu_bar = meter(bar_w, cpu_pct)
-        cpu_line = f"CPU  {cpu_pct:5.1f}%"
-        safe_addnstr(stdscr, iy + 0, ix, cpu_line, iw, curses.color_pair(1) | curses.A_BOLD)
-        safe_addnstr(stdscr, iy + 0, ix + 14, cpu_bar, bar_w, self.pct_color(cpu_pct))
+        # wider bars + visible track
+        bar_w = max(28, min(60, iw - 34))
+        if bar_w < 20:
+            bar_w = max(18, iw // 2)
 
-        # MEM
-        mem_bar = meter(bar_w, mem_pct)
-        mem_line = f"MEM  {human_bytes_dec(mem_used)} / {human_bytes_dec(mem_total)}"
-        safe_addnstr(stdscr, iy + 1, ix, ellipsize(mem_line, iw), iw, curses.color_pair(1) | curses.A_BOLD)
-        safe_addnstr(stdscr, iy + 1, ix + 14, mem_bar, bar_w, self.pct_color(mem_pct))
-        safe_addnstr(stdscr, iy + 1, ix + 14 + bar_w + 2, f"{mem_pct:4.1f}%", iw, curses.color_pair(6))
+        def row(label, pct, left_text, right_text, row_y):
+            safe_addnstr(stdscr, row_y, ix, f"{label:<4}", 4, curses.color_pair(3) | curses.A_BOLD)
+            safe_addnstr(stdscr, row_y, ix + 5, meter(bar_w, pct), bar_w, self.pct_color(pct))
+            safe_addnstr(stdscr, row_y, ix + 5 + bar_w + 2, f"{pct:5.1f}%", 7, curses.color_pair(6))
+            safe_addnstr(stdscr, row_y, ix + 5 + bar_w + 10, ellipsize(left_text, 999), iw, curses.color_pair(1))
+            if right_text:
+                safe_addnstr(stdscr, row_y, x + w - len(right_text) - 3, right_text, len(right_text), curses.color_pair(6))
 
-        # DSK
-        dsk_bar = meter(bar_w, d_pct)
-        dsk_line = f"DSK  {human_bytes_dec(d_used)} / {human_bytes_dec(d_total)}"
-        safe_addnstr(stdscr, iy + 2, ix, ellipsize(dsk_line, iw), iw, curses.color_pair(1) | curses.A_BOLD)
-        safe_addnstr(stdscr, iy + 2, ix + 14, dsk_bar, bar_w, self.pct_color(d_pct))
-        safe_addnstr(stdscr, iy + 2, ix + 14 + bar_w + 2, f"{d_pct:4.1f}%", iw, curses.color_pair(6))
+        row("CPU", cpu_pct, "", "", iy + 0)
+        row("MEM", mem_pct, f"{human_bytes_dec(mem_used)} | {human_bytes_dec(mem_total)}", "", iy + 1)
+        row("DSK", d_pct, f"{human_bytes_dec(d_used)} | {human_bytes_dec(d_total)}", "", iy + 2)
 
-        # NET
         net_line = f"NET  ↓ {human_rate_dec(rx)}   ↑ {human_rate_dec(tx)}"
         safe_addnstr(stdscr, iy + 3, ix, ellipsize(net_line, iw), iw, curses.color_pair(6))
 
     def draw_processes(self, stdscr, y, x, h, w):
-        title = f"PROCESSES  (sort: {self.sort_mode.lower()}  •  filter: {(self.filter_text or '—')})"
+        title = f"PROCESSES  |  sort {self.sort_mode.lower()}  |  filter {(self.filter_text or '—')}"
         draw_box(stdscr, y, x, h, w, title, curses.color_pair(2), curses.color_pair(2))
 
-        # table header
         ix, iy = x + 2, y + 2
         iw = w - 4
 
@@ -607,11 +629,10 @@ class TaskMan:
         safe_addnstr(stdscr, iy, ix + col_name + 1 + col_cpu + 1, "MEM", col_mem, hdr)
         safe_addnstr(stdscr, iy, ix + col_name + 1 + col_cpu + 1 + col_mem + 1, "PID", col_pid, hdr)
         safe_addnstr(stdscr, iy, ix + col_name + 1 + col_cpu + 1 + col_mem + 1 + col_pid + 1, "USER", col_user, hdr)
-
         safe_hline(stdscr, iy + 1, ix, ord("─"), iw, curses.color_pair(1))
 
         rows_y = iy + 2
-        rows_avail = max(1, h - 5)  # minus borders/header
+        rows_avail = max(1, h - 5)
         n = len(self.procs)
 
         if self.selected < self.scroll:
@@ -650,17 +671,16 @@ class TaskMan:
             safe_addnstr(stdscr, yy, ix + col_name + 1 + col_cpu + 1 + col_mem + 1 + col_pid + 1, user, col_user, row_attr)
 
     def draw_keys(self, stdscr, h, w):
-        # compact, readable, clean (two lines)
         safe_hline(stdscr, h - 3, 0, ord("─"), w, curses.color_pair(1))
         safe_fill(stdscr, h - 2, 0, w, curses.color_pair(1))
         safe_fill(stdscr, h - 1, 0, w, curses.color_pair(1))
 
-        line1 = "↑↓ Select   PgUp/PgDn Jump   Enter Terminate   K Kill"
-        line2 = "S Sort   / Filter   R Refresh   Q Exit"
-        safe_addnstr(stdscr, h - 2, 2, ellipsize(line1, w - 4), w - 4, curses.color_pair(2))
-        safe_addnstr(stdscr, h - 1, 2, ellipsize(line2, w - 4), w - 4, curses.color_pair(2) | curses.A_BOLD)
+        left = "↑↓ Select | PgUp/PgDn Jump | Enter Terminate | K Kill"
+        right = "S Sort | / Filter | R Refresh | Q Exit"
+        safe_addnstr(stdscr, h - 2, 2, ellipsize(left, w - 4), w - 4, curses.color_pair(2))
+        safe_addnstr(stdscr, h - 1, 2, ellipsize(right, w - 4), w - 4, curses.color_pair(2) | curses.A_BOLD)
 
-    # -------------------- main loop --------------------
+    # -------------------- loop --------------------
 
     def run(self, stdscr):
         curses.curs_set(0)
@@ -684,7 +704,7 @@ class TaskMan:
             if now - last_refresh >= REFRESH_SEC:
                 dt = now - last_refresh
                 last_refresh = now
-                dt_last = max(0.50, dt)
+                dt_last = max(0.75, dt)
                 self.refresh_system(dt_last)
                 self.refresh_processes()
                 need_redraw = True
@@ -700,7 +720,7 @@ class TaskMan:
                     return
 
                 if ch in (ord("r"), ord("R")):
-                    self.refresh_system(max(0.50, dt_last))
+                    self.refresh_system(max(0.75, dt_last))
                     self.refresh_processes()
                     self.toast("refreshed", 1.0)
                     need_redraw = True
@@ -739,7 +759,7 @@ class TaskMan:
                     self.selected = min(max(0, len(self.procs) - 1), self.selected + JUMP_ROWS)
                     need_redraw = True
 
-                elif ch in (10, 13, curses.KEY_ENTER):  # Enter = terminate
+                elif ch in (10, 13, curses.KEY_ENTER):
                     if self.procs:
                         pid = self.procs[self.selected]["pid"]
                         ok, err = self.kill_pid(pid, signal.SIGTERM)
@@ -747,7 +767,7 @@ class TaskMan:
                         self.refresh_processes()
                         need_redraw = True
 
-                elif ch in (ord("k"), ord("K")):  # K = kill
+                elif ch in (ord("k"), ord("K")):
                     if self.procs:
                         pid = self.procs[self.selected]["pid"]
                         ok, err = self.kill_pid(pid, signal.SIGKILL)
@@ -760,7 +780,6 @@ class TaskMan:
                 h, w = stdscr.getmaxyx()
                 stdscr.erase()
 
-                # minimum size for this layout
                 if h < 26 or w < 110:
                     msg = "Resize terminal (recommended >= 110x26)."
                     safe_addnstr(stdscr, 0, 2, msg, w - 4, curses.color_pair(2) | curses.A_BOLD)
@@ -768,8 +787,6 @@ class TaskMan:
                     time.sleep(0.06)
                     continue
 
-                # Layout:
-                # 0-2 header, 3 spacer, performance box, then smaller process box, then keys.
                 self.draw_header(stdscr, w)
 
                 perf_h = 8
@@ -778,7 +795,6 @@ class TaskMan:
                 perf_w = w - 4
                 self.draw_performance(stdscr, perf_y, perf_x, perf_h, perf_w)
 
-                # Process panel intentionally smaller (fixed height)
                 proc_h = PROCS_PANEL_ROWS
                 proc_y = perf_y + perf_h + 1
                 proc_x = 2
@@ -793,7 +809,7 @@ class TaskMan:
             time.sleep(0.03)
 
 def main():
-    # best-effort: push terminal into black background before curses (some themes ignore this)
+    # try to force terminal into black bg before curses (helps on some clients)
     try:
         sys.stdout.write("\033[40m\033[2J\033[H")
         sys.stdout.flush()
