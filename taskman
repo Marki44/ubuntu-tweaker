@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # taskman — clean TUI task manager (Ubuntu 20/22/24, Python 3.8+)
 #
-# Controls:
+# Keys:
 #   ↑↓            Select process
 #   Left click    Select process
 #   Enter         Terminate (SIGTERM)
 #   K             Kill (SIGKILL)
-#   S             Sort (CPU → MEM → PID → NAME)  [applies once; list stays stable]
-#   D             Dynamic ON/OFF (when ON: list re-sorts every refresh)
-#   /             Search (opens in the empty area below processes)
-#   R             Refresh processes only (top stats are always live)
+#   S             Sort (CPU → MEM → PID → NAME)   (stable list)
+#   D             Dynamic ON/OFF (when ON: auto-refresh + auto-resort)
+#   /             Search (inline box under processes)
+#   R             Refresh processes (manual)
 #   Q             Exit
 
 import os
@@ -19,8 +19,10 @@ import curses
 import shutil
 import signal
 
-REFRESH_SEC = 1.0
-UI_FPS = 8
+
+REFRESH_SYS_SEC = 1.0
+DYNAMIC_PROC_SEC = 1.0
+UI_FPS = 12
 MAX_PROCS_SCAN = 7000
 
 
@@ -185,7 +187,8 @@ def safe_addnstr(stdscr, y, x, s, n, attr=0):
         h, w = stdscr.getmaxyx()
         if y < 0 or y >= h or x < 0 or x >= w:
             return
-        maxn = max(0, min(n, w - x - 1))
+        # clamp to screen width (no "-1" so we don't under-print borders)
+        maxn = max(0, min(n, w - x))
         if maxn <= 0:
             return
         if attr:
@@ -363,7 +366,7 @@ def read_proc_cmd(pid):
 
 class TaskMan:
     def __init__(self):
-        # default: CPU sort, stable (dynamic OFF)
+        # default: cpu sort, stable list
         self.sort_mode = "CPU"
         self.dynamic_sort = False
         self.search_text = ""
@@ -398,9 +401,12 @@ class TaskMan:
         self.cores = os.cpu_count() or 1
         self.disk_hw = root_disk_hardware()
 
-        # inline search UI state (no overlay)
+        # inline search UI
         self.search_mode = False
         self.search_buf = ""
+
+        # manual refresh flag
+        self.proc_dirty = True
 
     def init_colors(self, stdscr):
         curses.start_color()
@@ -409,13 +415,13 @@ class TaskMan:
         except Exception:
             pass
 
-        curses.init_pair(1, curses.COLOR_WHITE, -1)   # base
-        curses.init_pair(2, curses.COLOR_CYAN, -1)    # headings
-        curses.init_pair(3, curses.COLOR_MAGENTA, -1) # accents
-        curses.init_pair(4, curses.COLOR_YELLOW, -1)  # highlight
-        curses.init_pair(5, curses.COLOR_RED, -1)     # hot
+        curses.init_pair(1, curses.COLOR_WHITE, -1)    # base
+        curses.init_pair(2, curses.COLOR_CYAN, -1)     # headings
+        curses.init_pair(3, curses.COLOR_MAGENTA, -1)  # accents
+        curses.init_pair(4, curses.COLOR_YELLOW, -1)   # header highlight
+        curses.init_pair(5, curses.COLOR_RED, -1)      # hot
         curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_WHITE)  # selected row
-        curses.init_pair(7, curses.COLOR_WHITE, -1)   # subtle
+        curses.init_pair(7, curses.COLOR_WHITE, -1)    # subtle
 
         stdscr.bkgd(" ", curses.color_pair(1))
         stdscr.erase()
@@ -454,7 +460,6 @@ class TaskMan:
         swap_total_kb = mi.get("SwapTotal", 0)
         swap_free_kb = mi.get("SwapFree", 0)
         swap_used_kb = max(0, swap_total_kb - swap_free_kb)
-        swap_pct = (swap_used_kb / swap_total_kb * 100.0) if swap_total_kb else 0.0
 
         d_total, d_used, _ = disk_usage_root()
         d_pct = (d_used / d_total * 100.0) if d_total else 0.0
@@ -479,7 +484,6 @@ class TaskMan:
 
             "swap_used": swap_used_kb * 1024,
             "swap_total": swap_total_kb * 1024,
-            "swap_pct": swap_pct,
 
             "disk_used": d_used,
             "disk_total": d_total,
@@ -489,18 +493,7 @@ class TaskMan:
             "tx_rate": self.tx_rate,
         }
 
-    def _apply_sort_once(self):
-        items = []
-        seen = set()
-        for pid in self.order:
-            p = self.procs_by_pid.get(pid)
-            if p:
-                items.append(p)
-                seen.add(pid)
-        for pid, p in self.procs_by_pid.items():
-            if pid not in seen:
-                items.append(p)
-
+    def _sort_items(self, items):
         if self.sort_mode == "MEM":
             items.sort(key=lambda x: (x["mem"], x["cpu"]), reverse=True)
         elif self.sort_mode == "PID":
@@ -510,16 +503,14 @@ class TaskMan:
         else:
             items.sort(key=lambda x: (x["cpu"], x["mem"]), reverse=True)
 
-        self.order = [p["pid"] for p in items]
-
     def refresh_processes(self):
+        # heavier scan: only when requested OR when dynamic is ON
         pids = list_pids()
         cpu_total, _ = read_cpu_total_idle()
         total_delta = max(1, cpu_total - self.prev_cpu_total_for_procs) if self.prev_cpu_total_for_procs else 1
         self.prev_cpu_total_for_procs = cpu_total
 
         alive_set = set()
-        stxt = self.search_text.lower().strip()
 
         for pid in pids:
             ticks = read_proc_stat_ticks(pid)
@@ -550,25 +541,33 @@ class TaskMan:
             if pid not in alive_set:
                 self.procs_by_pid.pop(pid, None)
 
-        self.order = [pid for pid in self.order if pid in self.procs_by_pid]
-
-        # first time: apply default CPU sort once
+        # keep old order by default (stable), unless first time
         if not self.order:
-            self.order = sorted(self.procs_by_pid.keys())
-            self._apply_sort_once()
+            items = list(self.procs_by_pid.values())
+            self._sort_items(items)  # default sort once
+            self.order = [p["pid"] for p in items]
+        else:
+            # keep existing order, append new pids to end
+            known = set(self.order)
+            for pid in self.procs_by_pid.keys():
+                if pid not in known:
+                    self.order.append(pid)
 
-        # dynamic: keep re-sorting each refresh
+        # dynamic ON: re-sort every refresh
         if self.dynamic_sort:
-            self._apply_sort_once()
+            items = [self.procs_by_pid[pid] for pid in self.order if pid in self.procs_by_pid]
+            self._sort_items(items)
+            self.order = [p["pid"] for p in items]
 
+        # build view with search
+        stxt = self.search_text.lower().strip()
         view = []
         if stxt:
             for pid in self.order:
                 p = self.procs_by_pid.get(pid)
                 if not p:
                     continue
-                low = p["cmd"].lower()
-                if stxt in low or stxt in p["user"].lower() or stxt in str(pid):
+                if (stxt in p["cmd"].lower()) or (stxt in p["user"].lower()) or (stxt in str(pid)):
                     view.append(p)
         else:
             for pid in self.order:
@@ -581,16 +580,7 @@ class TaskMan:
             self.selected = max(0, len(self.view) - 1)
         self.view_scroll = clamp(self.view_scroll, 0, max(0, len(self.view) - 1))
 
-    def kill_pid(self, pid, sig):
-        try:
-            os.kill(pid, sig)
-            return True, ""
-        except PermissionError:
-            return False, "permission denied"
-        except ProcessLookupError:
-            return False, "no such process"
-        except Exception as e:
-            return False, str(e)
+        self.proc_dirty = False
 
     def ensure_selected_visible(self, rows_avail):
         if not self.view:
@@ -605,16 +595,31 @@ class TaskMan:
         max_scroll = max(0, len(self.view) - rows_avail)
         self.view_scroll = clamp(self.view_scroll, 0, max_scroll)
 
+    def kill_pid(self, pid, sig):
+        try:
+            os.kill(pid, sig)
+            return True, ""
+        except PermissionError:
+            return False, "permission denied"
+        except ProcessLookupError:
+            return False, "no such process"
+        except Exception as e:
+            return False, str(e)
+
     def cycle_sort(self):
         order = ["CPU", "MEM", "PID", "NAME"]
         i = order.index(self.sort_mode) if self.sort_mode in order else 0
         self.sort_mode = order[(i + 1) % len(order)]
-        self._apply_sort_once()
-        self.refresh_processes()
+        # stable sort applies once now (and stays stable)
+        items = [self.procs_by_pid[pid] for pid in self.order if pid in self.procs_by_pid]
+        self._sort_items(items)
+        self.order = [p["pid"] for p in items]
+        self.proc_dirty = True
         self.toast(f"sort: {self.sort_mode.lower()}")
 
     def toggle_dynamic(self):
         self.dynamic_sort = not self.dynamic_sort
+        self.proc_dirty = True
         self.toast(f"dynamic: {'on' if self.dynamic_sort else 'off'}")
 
     def begin_search(self):
@@ -631,7 +636,7 @@ class TaskMan:
         self.selected = 0
         self.view_scroll = 0
         self.search_mode = False
-        self.refresh_processes()
+        self.proc_dirty = True
         self.toast("search set" if self.search_text else "search cleared")
 
     # -------------------- drawing --------------------
@@ -648,7 +653,7 @@ class TaskMan:
         safe_addnstr(stdscr, 0, max(2, w - len(right) - 2), right, len(right), curses.color_pair(2))
 
         left2 = f"{self.os_name}  •  Kernel {self.kernel}"
-        cpu_short = ellipsize(self.cpu_model, max(34, w // 2 - 18))
+        cpu_short = ellipsize(self.cpu_model, max(28, w // 2 - 18))
         right2 = f"{cpu_short}  •  Cores {self.cores}"
         safe_fill(stdscr, 1, 0, w, curses.color_pair(1))
         safe_addnstr(stdscr, 1, 2, ellipsize(left2, w - 4), w - 4, curses.color_pair(7))
@@ -665,7 +670,8 @@ class TaskMan:
         draw_box(stdscr, y, x, h, w, "PERFORMANCE",
                  curses.color_pair(2), curses.color_pair(2) | curses.A_BOLD, curses.color_pair(1))
 
-        ix, iy = x + 2, y + 2
+        # tighter: start immediately inside border
+        ix, iy = x + 2, y + 1
         iw = w - 4
 
         mem_total = self.sys["mem_total"]
@@ -678,14 +684,14 @@ class TaskMan:
         line_a = f"Memory: {human_bytes_dec(mem_total)}  •  Swap: {human_bytes_dec(swap_total)}"
         line_b = f"Disk: {disk_type} {disk_model}  •  {disk_dev}  •  {fs}"
 
-        safe_addnstr(stdscr, iy + 0, ix, ellipsize(line_a, iw), iw, curses.color_pair(7))
-        safe_addnstr(stdscr, iy + 1, ix, ellipsize(line_b, iw), iw, curses.color_pair(7))
+        safe_addnstr(stdscr, iy + 1, ix, ellipsize(line_a, iw), iw, curses.color_pair(7))
+        safe_addnstr(stdscr, iy + 2, ix, ellipsize(line_b, iw), iw, curses.color_pair(7))
 
-        inner = max(18, min(28, iw - 52))
+        inner = max(18, min(26, iw - 52))
 
-        cpu_pct = self.sys["cpu_pct"]
         mem_used = self.sys["mem_used"]
         mem_pct = self.sys["mem_pct"]
+        cpu_pct = self.sys["cpu_pct"]
         d_used = self.sys["disk_used"]
         d_pct = self.sys["disk_pct"]
         rx = self.sys["rx_rate"]
@@ -699,19 +705,19 @@ class TaskMan:
             if extra:
                 safe_addnstr(stdscr, row_y, ix + 5 + len(bar) + 10, extra, iw - (5 + len(bar) + 10), curses.color_pair(1))
 
-        # order: MEM then CPU (as requested)
-        row("MEM", mem_pct, f"{human_bytes_dec(mem_used)} | {human_bytes_dec(mem_total)}", iy + 3)
-        row("CPU", cpu_pct, "", iy + 5)
-        row("DSK", d_pct, f"{human_bytes_dec(d_used)} | {human_bytes_dec(self.sys['disk_total'])}", iy + 7)
+        # order: MEM then CPU
+        row("MEM", mem_pct, f"{human_bytes_dec(mem_used)} | {human_bytes_dec(mem_total)}", iy + 4)
+        row("CPU", cpu_pct, "", iy + 6)
+        row("DSK", d_pct, f"{human_bytes_dec(d_used)} | {human_bytes_dec(self.sys['disk_total'])}", iy + 8)
 
         net_line = f"NET  ↓ {human_rate_dec(rx)}   ↑ {human_rate_dec(tx)}"
-        safe_addnstr(stdscr, iy + 9, ix, ellipsize(net_line, iw), iw, curses.color_pair(7))
+        safe_addnstr(stdscr, iy + 10, ix, ellipsize(net_line, iw), iw, curses.color_pair(7))
 
     def draw_processes(self, stdscr, y, x, h, w):
         draw_box(stdscr, y, x, h, w, "PROCESSES",
-                 curses.color_pair(2), curses.color_pair(2), curses.color_pair(1))
+                 curses.color_pair(2), curses.color_pair(2) | curses.A_BOLD, curses.color_pair(1))
 
-        ix, iy = x + 2, y + 2
+        ix, iy = x + 2, y + 1
         iw = w - 4
 
         dyn = "on" if self.dynamic_sort else "off"
@@ -720,7 +726,9 @@ class TaskMan:
         status = f"sort {sortname}  •  dynamic {dyn}  •  search {st}"
         safe_addnstr(stdscr, iy, ix, ellipsize(status, iw), iw, curses.color_pair(7))
 
-        # columns
+        # header row directly under status
+        yy_hdr = iy + 2
+
         col_cpu = 7
         col_mem = 10
         col_pid = 8
@@ -730,15 +738,16 @@ class TaskMan:
             col_name = 18
 
         hdr = curses.color_pair(4) | curses.A_BOLD
-        yy_hdr = iy + 2
         safe_addnstr(stdscr, yy_hdr, ix, "NAME", col_name, hdr)
         safe_addnstr(stdscr, yy_hdr, ix + col_name + 1, "CPU", col_cpu, hdr)
         safe_addnstr(stdscr, yy_hdr, ix + col_name + 1 + col_cpu + 1, "MEM", col_mem, hdr)
         safe_addnstr(stdscr, yy_hdr, ix + col_name + 1 + col_cpu + 1 + col_mem + 1, "PID", col_pid, hdr)
         safe_addnstr(stdscr, yy_hdr, ix + col_name + 1 + col_cpu + 1 + col_mem + 1 + col_pid + 1, "USER", col_user, hdr)
 
+        # rows area
         rows_y = yy_hdr + 1
-        rows_avail = max(1, h - 5)  # borders + status + header + footer gap
+        # inside height is (h-2) lines; we used 1 status + 1 blank + 1 header => rows start at iy+3
+        rows_avail = max(1, (y + h - 1) - rows_y)  # up to inside bottom
         self.ensure_selected_visible(rows_avail)
 
         n = len(self.view)
@@ -774,20 +783,17 @@ class TaskMan:
             safe_addnstr(stdscr, yy, ix + col_name + 1 + col_cpu + 1 + col_mem + 1, ellipsize(pid, col_pid), col_pid, row_attr)
             safe_addnstr(stdscr, yy, ix + col_name + 1 + col_cpu + 1 + col_mem + 1 + col_pid + 1, user, col_user, row_attr)
 
-    def draw_search_area(self, stdscr, y, x, h, w):
-        if h < 3:
-            return
+    def draw_search_box(self, stdscr, y, x, h, w):
         draw_box(stdscr, y, x, h, w, "SEARCH",
                  curses.color_pair(2), curses.color_pair(2) | curses.A_BOLD, curses.color_pair(1))
         ix, iy = x + 2, y + 1
         iw = w - 4
 
-        hint = "Enter apply  •  Esc cancel  •  Backspace delete"
+        hint = "Type to search • Enter apply • Esc cancel"
         safe_addnstr(stdscr, iy, ix, ellipsize(hint, iw), iw, curses.color_pair(7))
 
         prompt = "> " + self.search_buf
         safe_addnstr(stdscr, iy + 1, ix, ellipsize(prompt, iw), iw, curses.color_pair(1) | curses.A_BOLD)
-
         try:
             curses.curs_set(1)
             stdscr.move(iy + 1, min(ix + 2 + len(self.search_buf), x + w - 2))
@@ -796,7 +802,6 @@ class TaskMan:
 
     def draw_footer(self, stdscr, h, w):
         safe_fill(stdscr, h - 1, 0, w, curses.color_pair(1))
-
         key_attr = curses.color_pair(2) | curses.A_BOLD
         text_attr = curses.color_pair(7)
 
@@ -817,7 +822,7 @@ class TaskMan:
             segk = f"[{k}]"
             segt = f" {label} "
             need = len(segk) + len(segt) + 2
-            if x + need >= w - 2:
+            if x + need >= w - 1:
                 break
             safe_addnstr(stdscr, h - 1, x, segk, len(segk), key_attr)
             x += len(segk)
@@ -825,6 +830,36 @@ class TaskMan:
             x += len(segt)
             safe_addnstr(stdscr, h - 1, x, "│", 1, curses.color_pair(1))
             x += 2
+
+    def layout(self, h, w):
+        # header: 3 lines
+        header_h = 3
+        perf_h = 12
+        footer_h = 1
+        gap = h - (header_h + perf_h + footer_h + 3)  # 2 spacers + margins
+        gap = max(8, gap)
+
+        search_h = 4 if self.search_mode else 0
+        proc_h = max(8, gap - search_h)
+
+        header_y = 0
+        perf_y = header_y + header_h
+        perf_y += 0  # already placed
+        perf_y = 3
+        perf_x = 2
+        perf_w = w - 4
+
+        proc_y = perf_y + perf_h + 1
+        proc_x = 2
+        proc_w = w - 4
+
+        search_y = proc_y + proc_h + 1
+
+        return {
+            "perf": (perf_y, perf_x, perf_h, perf_w),
+            "proc": (proc_y, proc_x, proc_h, proc_w),
+            "search": (search_y, 2, search_h, w - 4),
+        }
 
     def run(self, stdscr):
         curses.curs_set(0)
@@ -837,34 +872,38 @@ class TaskMan:
         self.prev_rx, self.prev_tx = read_net_bytes_total()
 
         last_sys = time.monotonic()
-        last_proc = time.monotonic()
         last_draw = 0.0
+        last_dyn_proc = 0.0
 
-        self.refresh_system(REFRESH_SEC)
+        self.refresh_system(REFRESH_SYS_SEC)
         self.refresh_processes()
 
         while True:
             now = time.monotonic()
 
-            if now - last_sys >= REFRESH_SEC:
+            # always dynamic system stats
+            if now - last_sys >= REFRESH_SYS_SEC:
                 dt = now - last_sys
                 last_sys = now
                 self.refresh_system(max(1.0, dt))
 
-            if now - last_proc >= REFRESH_SEC:
-                last_proc = now
+            # processes: only refresh when dirty OR dynamic ON
+            if self.dynamic_sort and (now - last_dyn_proc >= DYNAMIC_PROC_SEC):
+                last_dyn_proc = now
+                self.refresh_processes()
+            elif self.proc_dirty:
                 self.refresh_processes()
 
+            # input
             ch = -1
             try:
                 ch = stdscr.getch()
             except Exception:
                 ch = -1
 
-            # search mode: capture input without overlay dialogs
             if self.search_mode:
                 if ch != -1:
-                    if ch == 27:  # Esc
+                    if ch == 27:  # esc
                         self.cancel_search()
                         curses.curs_set(0)
                     elif ch in (10, 13, curses.KEY_ENTER):
@@ -874,13 +913,12 @@ class TaskMan:
                         self.search_buf = self.search_buf[:-1]
                     elif 32 <= ch <= 126:
                         self.search_buf += chr(ch)
-                # still allow redraw below
             else:
                 if ch != -1:
                     if ch in (ord("q"), ord("Q")):
                         return
                     if ch in (ord("r"), ord("R")):
-                        self.refresh_processes()
+                        self.proc_dirty = True
                         self.toast("processes refreshed")
                     elif ch in (ord("s"), ord("S")):
                         self.cycle_sort()
@@ -899,35 +937,32 @@ class TaskMan:
                             pid = self.view[self.selected]["pid"]
                             ok, err = self.kill_pid(pid, signal.SIGTERM)
                             self.toast("terminated" if ok else f"failed: {err}")
-                            self.refresh_processes()
+                            self.proc_dirty = True
                     elif ch in (ord("k"), ord("K")):
                         if self.view:
                             pid = self.view[self.selected]["pid"]
                             ok, err = self.kill_pid(pid, signal.SIGKILL)
                             self.toast("killed" if ok else f"failed: {err}")
-                            self.refresh_processes()
+                            self.proc_dirty = True
                     elif ch == curses.KEY_MOUSE:
                         try:
                             _, mx, my, _, bstate = curses.getmouse()
                         except Exception:
                             mx = my = bstate = 0
-
                         if bstate & getattr(curses, "BUTTON1_CLICKED", 0):
                             h, w = stdscr.getmaxyx()
-                            perf_h = 13
-                            perf_y = 3
-                            proc_y = perf_y + perf_h + 1
-                            proc_x = 2
-                            proc_h = 12
-                            proc_w = w - 4
-
-                            # rows start: border + title + status + header => y + 1 + 1 + 1 + 1
-                            rows_y = proc_y + 1 + 1 + 1 + 1  # = proc_y + 4
-                            if self.view and (proc_y <= my < proc_y + proc_h) and (proc_x <= mx < proc_x + proc_w):
+                            lay = self.layout(h, w)
+                            py, px, ph, pw = lay["proc"]
+                            # inside rows start:
+                            iy = py + 1
+                            yy_hdr = iy + 2
+                            rows_y = yy_hdr + 1
+                            if self.view and (py <= my < py + ph) and (px <= mx < px + pw):
                                 idx = self.view_scroll + (my - rows_y)
                                 if 0 <= (my - rows_y) and idx < len(self.view):
                                     self.selected = idx
 
+            # draw throttle
             if now - last_draw < (1.0 / float(UI_FPS)):
                 time.sleep(0.002)
                 continue
@@ -936,41 +971,36 @@ class TaskMan:
             h, w = stdscr.getmaxyx()
             stdscr.erase()
 
-            if h < 28 or w < 110:
-                safe_addnstr(stdscr, 0, 2, "Resize terminal (recommended >= 110x28).", w - 4,
+            if h < 26 or w < 110:
+                safe_addnstr(stdscr, 0, 2, "Resize terminal (recommended >= 110x26).", w - 4,
                              curses.color_pair(2) | curses.A_BOLD)
                 stdscr.refresh()
                 continue
 
             self.draw_header(stdscr, w)
 
-            perf_h = 13
-            perf_y = 3
-            perf_x = 2
-            perf_w = w - 4
-            self.draw_performance(stdscr, perf_y, perf_x, perf_h, perf_w)
+            lay = self.layout(h, w)
+            perf_y, perf_x, perf_h, perf_w = lay["perf"]
+            proc_y, proc_x, proc_h, proc_w = lay["proc"]
+            search_y, search_x, search_h, search_w = lay["search"]
 
-            proc_h = 12
-            proc_y = perf_y + perf_h + 1
-            proc_x = 2
-            proc_w = w - 4
+            self.draw_performance(stdscr, perf_y, perf_x, perf_h, perf_w)
             self.draw_processes(stdscr, proc_y, proc_x, proc_h, proc_w)
 
-            # Search box goes in the empty area between processes and footer
-            footer_y = h - 1
-            gap_top = proc_y + proc_h + 1
-            gap_h = max(0, footer_y - gap_top)
-            if self.search_mode and gap_h >= 3:
-                sh = min(4, gap_h)
-                self.draw_search_area(stdscr, gap_top, 2, sh, w - 4)
+            if self.search_mode and search_h >= 3:
+                self.draw_search_box(stdscr, search_y, search_x, search_h, search_w)
             else:
-                curses.curs_set(0)
+                try:
+                    curses.curs_set(0)
+                except Exception:
+                    pass
 
             self.draw_footer(stdscr, h, w)
             stdscr.refresh()
 
 
 def main():
+    # let curses.wrapper restore terminal; also force-reset colors just in case
     try:
         curses.wrapper(TaskMan().run)
     finally:
