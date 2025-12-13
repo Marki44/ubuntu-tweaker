@@ -3,6 +3,7 @@ import os
 import sys
 import subprocess
 from datetime import datetime
+from typing import List  # <-- Python 3.8 compatible typing
 
 LOG_FILE = "/var/log/server-baseline-menu.log"
 
@@ -34,19 +35,17 @@ RED     = "\033[31m"
 MAGENTA = "\033[35m"
 
 def clear_screen():
-    # Works well in SSH too
     print("\033[2J\033[H", end="")
 
 def pause_return():
     input(f"\n{DIM}Press Enter to return to menu...{RESET}")
 
 def box_line(text: str, width: int) -> str:
-    # Keeps menu aligned even if text shorter
     if len(text) > width - 4:
         text = text[: width - 7] + "..."
     return f"│ {text.ljust(width - 4)} │"
 
-def print_box(title: str, lines: list[str], width: int = 74):
+def print_box(title: str, lines: List[str], width: int = 74):  # <-- List[str] for py3.8
     top = "┌" + "─" * (width - 2) + "┐"
     mid = "├" + "─" * (width - 2) + "┤"
     bot = "└" + "─" * (width - 2) + "┘"
@@ -233,21 +232,17 @@ def action_network_bbr():
     header("Network Optimization + Enable BBR (safe defaults)")
     if not kernel_supports_bbr():
         log("BBR not available in this kernel. Skipping BBR enable.")
-        log("Tip: Ubuntu 20/22/24 usually supports it, but some VPS kernels differ.")
         return
 
     cfg = """# Safe network tuning: BBR + fq pacing + sane buffers (Ubuntu 20-24)
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
-
 net.core.rmem_max=8388608
 net.core.wmem_max=8388608
 net.ipv4.tcp_rmem=4096 87380 8388608
 net.ipv4.tcp_wmem=4096 65536 8388608
-
 net.core.somaxconn=1024
 net.ipv4.tcp_max_syn_backlog=2048
-
 net.ipv4.ip_local_port_range=10240 65535
 net.ipv4.tcp_mtu_probing=1
 """
@@ -309,8 +304,6 @@ def action_report():
 
     log("Top 15 slow boot units:")
     run(["bash", "-lc", "systemd-analyze blame | head -n 15"], check=False)
-
-    print()
     log(f"Log file: {LOG_FILE}")
 
 def action_release_upgrade_manual():
@@ -334,8 +327,7 @@ def action_release_upgrade_manual():
 
     print(f"{YELLOW}Detected:{RESET} Ubuntu {ver}")
     print(f"{YELLOW}Target:{RESET}   {target}\n")
-    print(f"{DIM}This runs Ubuntu's official upgrader (do-release-upgrade) and MUST be supervised.{RESET}")
-    print(f"{DIM}Recommended: snapshot/backup and run inside tmux/screen.{RESET}\n")
+    print(f"{DIM}This runs do-release-upgrade and MUST be supervised.{RESET}\n")
 
     ans = input("Type YES to start the interactive upgrade: ").strip()
     if ans != "YES":
@@ -344,38 +336,11 @@ def action_release_upgrade_manual():
 
     run(["apt-get", "update"] + APT_OPTS)
     run(["apt-get", "install"] + APT_OPTS + ["update-manager-core"])
-
-    # Ensure Prompt=lts
-    rug = "/etc/update-manager/release-upgrades"
-    try:
-        if os.path.exists(rug):
-            with open(rug, "r", encoding="utf-8") as f:
-                content = f.read()
-        else:
-            content = ""
-        if "Prompt=" not in content:
-            content += "\nPrompt=lts\n"
-        else:
-            lines = []
-            for line in content.splitlines(True):
-                if line.strip().startswith("Prompt="):
-                    lines.append("Prompt=lts\n")
-                else:
-                    lines.append(line)
-            content = "".join(lines)
-        with open(rug, "w", encoding="utf-8") as f:
-            f.write(content)
-    except Exception as e:
-        log(f"Could not adjust {rug}: {e}")
-
     log("Pre-upgrade: fully updating first...")
     action_update_upgrade_cleanup()
-
     run(["do-release-upgrade", "-c"], check=False)
-    log("Starting do-release-upgrade (interactive). Follow prompts on screen...")
+    log("Starting do-release-upgrade (interactive)...")
     run(["do-release-upgrade"], check=False)
-
-    log("Release upgrade finished. Reboot may be required.")
 
 def action_run_all():
     header("RUN ALL (safe baseline + optional extras)")
@@ -428,15 +393,12 @@ def menu():
         print_box(title, lines, width=80)
 
         choice = input(f"\n{BOLD}Select:{RESET} ").strip().lower()
-
         if choice in ("0", "q", "quit", "exit"):
             clear_screen()
             log("Exit.")
             return
 
-        # Clean screen before running actions (no menu spam)
         clear_screen()
-
         try:
             if choice == "1": action_update_upgrade_cleanup()
             elif choice == "2": action_install_base_tools()
