@@ -4,7 +4,6 @@ import sys
 import subprocess
 import shutil
 from datetime import datetime
-from typing import List
 
 LOG_FILE = "/var/log/server-baseline-menu.log"
 
@@ -417,18 +416,13 @@ def action_run_all():
 
 def action_task_manager():
     header("Task Manager")
-    print(f"{WHITE}Launching a task manager UI...{RESET}\n")
-    print(f"{DIM}Tips:{RESET} In htop, select a process → F9 Kill. In btop, use process tab → kill.\n")
 
-    # Prefer btop (most graphical), then htop, then top.
-    # If htop isn't installed yet, option 4 installs baseline tools (which includes htop).
-    if which("btop"):
-        subprocess.run(["btop"])
+    if not which("taskman"):
+        print(f"{RED}taskman is not installed.{RESET}")
+        print(f"{DIM}Run the repo installer (run.sh) again to install it, then run: sudo optimizer{RESET}")
         return
-    if which("htop"):
-        subprocess.run(["htop"])
-        return
-    subprocess.run(["top"])
+
+    subprocess.run(["taskman"])
 
 # ----------------------- Menu -----------------------
 def menu():
@@ -438,7 +432,7 @@ def menu():
 
         print(f"{BOLD}{WHITE}Main{RESET}")
         print(menu_item("1", "Run everything", "release upgrade not included"))
-        print(menu_item("2", "Task manager", "btop/htop/top"))
+        print(menu_item("2", "Task manager"))
         print()
 
         print(f"{BOLD}{WHITE}Maintenance{RESET}")
@@ -494,7 +488,7 @@ def menu():
 
 def main():
     if not is_root():
-        print("Run as root (sudo). Example:\n  sudo ./optimizer")
+        print("Run as root (sudo). Example:\n  sudo optimizer")
         sys.exit(1)
     menu()
 
