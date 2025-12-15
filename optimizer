@@ -153,24 +153,34 @@ APT::Periodic::Unattended-Upgrade "1";
         f.write(auto_up)
 
     f50 = "/etc/apt/apt.conf.d/50unattended-upgrades"
+    settings = {
+        'Unattended-Upgrade::Remove-Unused-Dependencies': '"true"',
+        'Unattended-Upgrade::Automatic-Reboot': '"false"',
+        'Unattended-Upgrade::Automatic-Reboot-Time': '"03:30"',
+    }
+
+    existing_keys = set()
     if os.path.exists(f50):
         with open(f50, "r", encoding="utf-8") as f:
-            content = f.read()
-        if 'Remove-Unused-Dependencies' not in content:
-            content += '\nUnattended-Upgrade::Remove-Unused-Dependencies "true";\n'
-        if 'Automatic-Reboot' not in content:
-            content += '\nUnattended-Upgrade::Automatic-Reboot "false";\n'
-        if 'Automatic-Reboot-Time' not in content:
-            content += '\nUnattended-Upgrade::Automatic-Reboot-Time "03:30";\n'
-        with open(f50, "w", encoding="utf-8") as f:
-            f.write(content)
-    else:
-        with open(f50, "w", encoding="utf-8") as f:
-            f.write(
-                'Unattended-Upgrade::Remove-Unused-Dependencies "true";\n'
-                'Unattended-Upgrade::Automatic-Reboot "false";\n'
-                'Unattended-Upgrade::Automatic-Reboot-Time "03:30";\n'
-            )
+            for line in f:
+                cleaned_line = line.strip()
+                if cleaned_line.startswith('//') or not cleaned_line:
+                    continue
+
+                parts = cleaned_line.split(None, 1)
+                if parts:
+                    existing_keys.add(parts[0])
+
+    to_append = []
+    for key, value in settings.items():
+        if key not in existing_keys:
+            to_append.append(f'{key} {value};')
+
+    if to_append:
+        with open(f50, "a", encoding="utf-8") as f:
+            f.write('\n')
+            for line in to_append:
+                f.write(line + '\n')
 
     run(["systemctl", "enable", "--now", "unattended-upgrades"], check=False)
     log("Done.")
@@ -338,16 +348,11 @@ def action_release_upgrade_manual():
         print(f"{YELLOW}Detected:{RESET} Ubuntu {ver}\n")
         print(f"{WHITE}Choose target:{RESET}")
         print(menu_item("1", "Upgrade to 22.04 LTS", "recommended"))
-        print(menu_item("2", "Upgrade to 24.04 LTS", "not direct from 20.04"))
         print(menu_item("0", "Back"))
         print()
         choice = input("Select: ").strip().lower()
         if choice in ("0", "q", "quit", "back"):
             log("Cancelled.")
-            return
-        if choice == "2":
-            print(f"\n{RED}20.04 → 24.04 is not a normal direct upgrade path.{RESET}")
-            print(f"{DIM}Do 20.04 → 22.04 first, then upgrade again to 24.04.{RESET}")
             return
         if choice != "1":
             print(f"{RED}Invalid choice.{RESET}")
@@ -431,8 +436,8 @@ def menu():
         print_menu_header(os_name, os_ver)
 
         print(f"{BOLD}{WHITE}Main{RESET}")
-        print(menu_item("1", "Run everything", "release upgrade not included"))
-        print(menu_item("2", "Task manager"))
+        print(menu_item("1", "Task manager"))
+        print(menu_item("2", "Run everything", "release upgrade not included"))
         print()
 
         print(f"{BOLD}{WHITE}Maintenance{RESET}")
@@ -466,8 +471,8 @@ def menu():
 
         clear_screen()
         try:
-            if choice == "1": action_run_all()
-            elif choice == "2": action_task_manager()
+            if choice == "1": action_task_manager()
+            elif choice == "2": action_run_all()
             elif choice == "3": action_update_upgrade_cleanup()
             elif choice == "4": action_install_base_tools()
             elif choice == "5": action_unattended_upgrades()
