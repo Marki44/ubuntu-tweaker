@@ -4,7 +4,7 @@
 # Keys:
 #   ↑↓            Select process
 #   Left click    Select process
-#   Enter         Terminate (SIGTERM)
+#   T             Terminate (SIGTERM)
 #   K             Kill (SIGKILL)
 #   S             Sort (CPU → MEM → PID → NAME)   (stable list)
 #   D             Dynamic ON/OFF (when ON: auto-refresh + auto-resort)
@@ -811,7 +811,7 @@ class TaskMan:
             ("S", "Sort"),
             ("D", "Dynamic"),
             ("/", "Search"),
-            ("Enter", "Terminate"),
+            ("T", "Terminate"),
             ("K", "Kill"),
             ("↑↓", "Select"),
             ("Click", "Select"),
@@ -932,7 +932,7 @@ class TaskMan:
                     elif ch == curses.KEY_DOWN:
                         if self.selected < max(0, len(self.view) - 1):
                             self.selected += 1
-                    elif ch in (10, 13, curses.KEY_ENTER):
+                    elif ch in (ord("t"), ord("T")):
                         if self.view:
                             pid = self.view[self.selected]["pid"]
                             ok, err = self.kill_pid(pid, signal.SIGTERM)
