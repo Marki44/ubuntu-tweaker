@@ -3,6 +3,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
+if [ -d "${SCRIPT_DIR}/.git" ]; then
+  echo "[+] This is a git repository. Checking for updates..."
+  cd "${SCRIPT_DIR}"
+  git pull
+  echo "[+] Update check complete."
+fi
+
 echo "[+] Installing requirements..."
 sudo apt-get update -y
 sudo apt-get install -y --no-install-recommends python3
