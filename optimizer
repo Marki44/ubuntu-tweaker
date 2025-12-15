@@ -153,24 +153,34 @@ APT::Periodic::Unattended-Upgrade "1";
         f.write(auto_up)
 
     f50 = "/etc/apt/apt.conf.d/50unattended-upgrades"
+    settings = {
+        'Unattended-Upgrade::Remove-Unused-Dependencies': '"true"',
+        'Unattended-Upgrade::Automatic-Reboot': '"false"',
+        'Unattended-Upgrade::Automatic-Reboot-Time': '"03:30"',
+    }
+
+    existing_keys = set()
     if os.path.exists(f50):
         with open(f50, "r", encoding="utf-8") as f:
-            content = f.read()
-        if 'Remove-Unused-Dependencies' not in content:
-            content += '\nUnattended-Upgrade::Remove-Unused-Dependencies "true";\n'
-        if 'Automatic-Reboot' not in content:
-            content += '\nUnattended-Upgrade::Automatic-Reboot "false";\n'
-        if 'Automatic-Reboot-Time' not in content:
-            content += '\nUnattended-Upgrade::Automatic-Reboot-Time "03:30";\n'
-        with open(f50, "w", encoding="utf-8") as f:
-            f.write(content)
-    else:
-        with open(f50, "w", encoding="utf-8") as f:
-            f.write(
-                'Unattended-Upgrade::Remove-Unused-Dependencies "true";\n'
-                'Unattended-Upgrade::Automatic-Reboot "false";\n'
-                'Unattended-Upgrade::Automatic-Reboot-Time "03:30";\n'
-            )
+            for line in f:
+                cleaned_line = line.strip()
+                if cleaned_line.startswith('//') or not cleaned_line:
+                    continue
+
+                parts = cleaned_line.split(None, 1)
+                if parts:
+                    existing_keys.add(parts[0])
+
+    to_append = []
+    for key, value in settings.items():
+        if key not in existing_keys:
+            to_append.append(f'{key} {value};')
+
+    if to_append:
+        with open(f50, "a", encoding="utf-8") as f:
+            f.write('\n')
+            for line in to_append:
+                f.write(line + '\n')
 
     run(["systemctl", "enable", "--now", "unattended-upgrades"], check=False)
     log("Done.")
